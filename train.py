@@ -1,0 +1,391 @@
+# -*- coding: utf-8 -*-
+"""
+train.py — training loop สำหรับ DINOv2 + length fusion + ArcFace
+
+ใช้จาก notebook/สคริปต์:
+    from config import TrainConfig
+    from train import run_training
+    best_ckpt = run_training(TrainConfig(data_dir="/content/dataset"))
+
+หรือ CLI:
+    python train.py --data_dir dataset --epochs 50 --finetune_mode lora
+    python train.py --data_dir dataset --kfold 5     # Stratified k-fold CV
+"""
+import argparse
+import math
+import os
+import random
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+
+from pytorch_metric_learning.losses import ArcFaceLoss
+
+from config import TrainConfig
+from dataset import (SurgicalInstrumentDataset, compute_length_stats,
+                     load_coco_records, stratified_split)
+from model import SurgicalDinoFusion, arcface_logits, count_trainable
+
+
+# ============================================================ utils
+def seed_everything(seed: int) -> None:
+    """fix seed ของทุก RNG เพื่อ reproduce ผล (สำคัญเมื่อข้อมูลน้อย split เปลี่ยน = ผลเปลี่ยน)"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
+    """
+    Mixup: สุ่ม interpolation ระหว่าง sample คู่สุ่ม
+    x: image tensor (B,3,H,W) | y: label (B,)
+    return: mixed_x, y_a, y_b, lam (lambda = interpolation ratio)
+
+    สำคัญสำหรับข้อมูลน้อย: ช่วย regularization โดย "เบลอ" ระหว่าง class
+    alpha=0.4 → lam ~ Beta(0.4, 0.4) มักจะอยู่ใกล้ 0 หรือ 1 (ไม่กลาง太多)
+    """
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1.0 - lam)  # ให้ lam >= 0.5 เสมอ เพื่อไม่ให้ label สลับกัน
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def torch_load_compat(path: str) -> dict:
+    """torch.load ที่รองรับทั้ง torch เก่า/ใหม่ (default weights_only เปลี่ยนใน torch 2.6)"""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def build_flip_flags(class_names: List[str], cfg: TrainConfig) -> List[bool]:
+    """flip ได้เฉพาะ class ที่อยู่ใน cfg.flip_allowed (None = flip ได้ทุก class)"""
+    allowed = set(cfg.flip_allowed) if cfg.flip_allowed is not None else None
+    return [True if allowed is None else n in allowed for n in class_names]
+
+
+def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]]:
+    """
+    อ่าน records จาก data_dir:
+      - ถ้ามี valid/_annotations.coco.json → ใช้เลย
+      - ถ้าไม่มี → stratified split จาก train ด้วย val_fraction/seed ของ config
+    """
+    tr, classes = load_coco_records(cfg.data_dir, "train")
+    valid_ann = os.path.join(cfg.data_dir, "valid", "_annotations.coco.json")
+    if os.path.exists(valid_ann):
+        va, classes_valid = load_coco_records(cfg.data_dir, "valid")
+        if classes_valid != classes:
+            raise ValueError(f"รายชื่อ class ต่างกันระหว่าง train/valid:\n{classes}\n{classes_valid}")
+    else:
+        tr, va = stratified_split(tr, cfg.val_fraction, cfg.seed)
+        print(f"[data] ไม่มีโฟลเดอร์ valid/ → stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
+    return tr, va, classes
+
+
+def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
+    """LR schedule: linear warmup → cosine decay ลงจนเกือบ 0 ตอนจบ"""
+    if step < warmup:
+        return step / max(1, warmup)
+    t = min((step - warmup) / max(1, total - warmup), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+# ============================================================ epochs
+def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device, cfg) -> float:
+    """เทรน 1 epoch → คืนค่า loss เฉลี่ย (ArcFace บน embedding จาก fusion head)"""
+    model.train()
+    total, seen = 0.0, 0
+    mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
+    for batch in loader:
+        px = batch["image"].to(device, non_blocking=True)
+        ln = batch["length"].to(device, non_blocking=True)
+        y = batch["label"].to(device, non_blocking=True)
+
+        # Mixup: สุ่ม interpolate ข้อมูล 2 ตัวอย่าง (regularization สำหรับข้อมูลน้อย)
+        use_mixup = mixup_alpha > 0 and model.training
+        if use_mixup:
+            px, y_a, y_b, lam = mixup_data(px, y, mixup_alpha)
+        else:
+            y_a, y_b, lam = y, y, 1.0
+
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:  # GPU → mixed precision
+            with torch.autocast("cuda"):
+                emb = model(px, ln)
+                if use_mixup:
+                    loss = lam * loss_fn(emb.float(), y_a) + (1 - lam) * loss_fn(emb.float(), y_b)
+                else:
+                    loss = loss_fn(emb.float(), y)  # cast fp32 ก่อนเข้า ArcFace เพื่อ stability
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:  # CPU → fp32
+            emb = model(px, ln)
+            if use_mixup:
+                loss = lam * loss_fn(emb, y_a) + (1 - lam) * loss_fn(emb, y_b)
+            else:
+                loss = loss_fn(emb, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
+        scheduler.step()  # per-step schedule (warmup+cosine)
+
+        total += loss.item() * y.size(0)
+        seen += y.size(0)
+    return total / max(seen, 1)
+
+
+@torch.no_grad()
+def validate(model, loss_fn, loader, device) -> Tuple[float, float]:
+    """
+    validation -> (val_loss, val_acc)
+    - val_loss: ArcFace loss on the val set (logged; tiebreak for best-model selection)
+    - val_acc : argmax over s*cos(theta) logits (true inference mode, no margin)
+    """
+    model.eval()
+    embs, ys = [], []
+    for batch in loader:
+        px = batch["image"].to(device, non_blocking=True)
+        ln = batch["length"].to(device, non_blocking=True)
+        embs.append(model(px, ln).float().cpu())
+        ys.append(batch["label"])
+    E = torch.cat(embs).to(device)
+    Y = torch.cat(ys).to(device)
+    loss = loss_fn(E, Y).item()
+    acc = (arcface_logits(loss_fn, E).argmax(dim=1) == Y).float().mean().item()
+    return loss, acc
+
+
+def save_history_plot(history: dict, out_png: str) -> None:
+    """วาดกราฟ loss/accuracy — fail ได้ (headless) โดยไม่ทำ training ล้ม"""
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+        ax[0].plot(history["train_loss"], label="train")
+        ax[0].plot(history["val_loss"], label="val")
+        ax[0].set_title("ArcFace loss"); ax[0].set_xlabel("epoch"); ax[0].legend(); ax[0].grid(alpha=.3)
+        ax[1].plot(history["val_acc"], color="tab:green")
+        ax[1].set_title("Validation accuracy"); ax[1].set_xlabel("epoch"); ax[1].grid(alpha=.3)
+        fig.savefig(out_png, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[log] บันทึกกราฟ history → {out_png}")
+    except Exception as e:  # noqa: BLE001 — การวาดกราฟไม่ควรทำให้เทรนพัง
+        print(f"(ข้ามการวาดกราฟ history: {e})")
+
+
+# ============================================================ main training entry
+def run_training(cfg: TrainConfig,
+                 records_train: Optional[List[dict]] = None,
+                 records_valid: Optional[List[dict]] = None,
+                 tag: str = "") -> str:
+    """
+    Train once (single split) — returns path of the best checkpoint (highest val accuracy)
+
+    checkpoint มี: model_state, arcface_state, classes, length_mean/std,
+                   cfg (dict), epoch, val_loss, val_acc
+    """
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    seed_everything(cfg.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------- ข้อมูล ----------
+    if records_train is None or records_valid is None:
+        records_train, records_valid, _ = resolve_records(cfg)
+    all_recs = list(records_train) + list(records_valid)
+    label2name = {r["label"]: r["class_name"] for r in all_recs}
+    class_names = [label2name[i] for i in range(max(label2name) + 1)]  # index เรียงเสมอ
+
+    # mean/std ของความยาว ← จาก train เท่านั้น (กัน leakage)
+    length_stats = compute_length_stats(records_train, cfg.calibration_ratio)
+    print(f"[data] train={len(records_train)} val={len(records_valid)} "
+          f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
+
+    flip_flags = build_flip_flags(class_names, cfg)
+    ds_train = SurgicalInstrumentDataset(records_train, length_stats, cfg.img_size,
+                                         cfg.calibration_ratio, flip_flags, training=True,
+                                         bbox_margin=cfg.bbox_margin)
+    ds_val = SurgicalInstrumentDataset(records_valid, length_stats, cfg.img_size,
+                                       cfg.calibration_ratio, flip_flags=None, training=False,
+                                       bbox_margin=cfg.bbox_margin)
+    pin = device.type == "cuda"
+    dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
+                          num_workers=cfg.num_workers, pin_memory=pin)
+    dl_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False,
+                        num_workers=cfg.num_workers, pin_memory=pin)
+
+    # ---------- โมเดล + loss ----------
+    model = SurgicalDinoFusion(
+        backbone_name=cfg.backbone_name, finetune_mode=cfg.finetune_mode,
+        lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
+        partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
+        use_attention_pool=getattr(cfg, "use_attention_pool", True),
+    ).to(device)
+    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode})")
+
+    # ArcFace: margin หน่วยองศา (~28.6° = 0.5 rad), s=64 — บังคับ embedding ให้
+    # intra-class แน่น / inter-class ห่าง เหมาะกับ class ที่รูปทรงใกล้กันมาก
+    loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
+                          margin=cfg.margin, scale=cfg.scale).to(device)
+
+    # ---------- optimizer + LR schedule (warmup → cosine) ----------
+    if cfg.finetune_mode == "partial":
+        lr_bb = cfg.lr_backbone
+    elif cfg.finetune_mode == "lora":
+        lr_bb = cfg.lr_lora
+    else:
+        lr_bb = None
+    optimizer = AdamW(model.param_groups(cfg.lr_head, lr_bb), weight_decay=cfg.weight_decay)
+
+    total_steps = max(1, len(dl_train)) * cfg.epochs
+    warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda s: warmup_cosine_factor(s, warmup_steps, total_steps))
+
+    if device.type == "cuda":
+        try:
+            scaler = torch.amp.GradScaler("cuda")   # torch >= 2.3
+        except (AttributeError, TypeError):
+            scaler = torch.cuda.amp.GradScaler()    # fallback torch เก่า
+    else:
+        scaler = None
+
+    # ---------- loop + early stopping ----------
+    history = {"train_loss": [], "val_loss": [], "val_acc": []}
+    # เลือก best ด้วย "val_acc" (val_loss เป็น tiebreak) — ผ่านการจำลองพบว่าบนข้อมูลน้อย
+    # ArcFace val_loss กับ val_acc แย่งกัน (loss ต่ำสุด ≠ โมเดลดีที่สุด); spec เดิมให้ดู val loss
+    best = {"val_loss": float("inf"), "val_acc": -1.0, "epoch": -1, "model": None, "arcface": None}
+    bad_epochs = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg)
+        vl, va = validate(model, loss_fn, dl_val, device)
+        history["train_loss"].append(tl); history["val_loss"].append(vl); history["val_acc"].append(va)
+
+        improved = va > best["val_acc"] + 1e-4 or \
+            (va >= best["val_acc"] - 1e-4 and vl < best["val_loss"] - 1e-4)
+        star = ""
+        if improved:
+            best.update(val_loss=vl, val_acc=va, epoch=epoch,
+                        model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                        arcface={k: v.detach().cpu().clone() for k, v in loss_fn.state_dict().items()})
+            bad_epochs = 0
+            star = "  *best*"
+            # เซฟทันที — หยุดกลางคันก็ไม่หาย (early-stop ก่อนก็มีไฟล์)
+            try:
+                ckpt_immediate = os.path.join(cfg.output_dir, f"best_model{tag}.pt")
+                torch.save({
+                    "model_state": best["model"],
+                    "arcface_state": best["arcface"],
+                    "classes": class_names,
+                    "length_mean": float(length_stats[0]),
+                    "length_std": float(length_stats[1]),
+                    "calibration_ratio": cfg.calibration_ratio,
+                    "cfg": cfg.to_dict(),
+                    "epoch": best["epoch"],
+                    "val_loss": float(best["val_loss"]),
+                    "val_acc": float(best["val_acc"]),
+                }, ckpt_immediate)
+            except Exception as e:
+                print(f"(ข้ามเซฟ immediate: {e})")
+        else:
+            bad_epochs += 1
+        cur_lr = scheduler.get_last_lr()[0]
+        print(f"{tag}[epoch {epoch:03d}/{cfg.epochs}] train={tl:.4f} val={vl:.4f} "
+              f"val_acc={va:.4f} lr={cur_lr:.2e}{star}", flush=True)
+
+        if bad_epochs >= cfg.patience:
+            print(f"[early stop] ไม่ปรับปรุง {cfg.patience} epoch — หยุดที่ epoch {epoch}")
+            break
+
+    # ---------- save best checkpoint ----------
+    ckpt_path = os.path.join(cfg.output_dir, f"best_model{tag}.pt")
+    torch.save({
+        "model_state": best["model"],
+        "arcface_state": best["arcface"],
+        "classes": class_names,
+        "length_mean": float(length_stats[0]),
+        "length_std": float(length_stats[1]),
+        "calibration_ratio": cfg.calibration_ratio,
+        "cfg": cfg.to_dict(),
+        "epoch": best["epoch"],
+        "val_loss": float(best["val_loss"]),
+        "val_acc": float(best["val_acc"]),
+    }, ckpt_path)
+    save_history_plot(history, os.path.join(cfg.output_dir, f"history{tag}.png"))
+
+    print(f"[done] best epoch={best['epoch']} val_loss={best['val_loss']:.4f} "
+          f"val_acc={best['val_acc']:.4f} → {ckpt_path}")
+    return ckpt_path
+
+
+# ============================================================ k-fold CV
+def run_kfold(cfg: TrainConfig, k: Optional[int] = None) -> Tuple[List[str], List[float]]:
+    """
+    Stratified k-fold CV บนข้อมูลทั้งหมด (train∪valid) — แม่นกว่า single split
+    เมื่อข้อมูลมีแค่ ~30 ภาพ/class; คืน (paths, val_acc ต่อ fold)
+    """
+    from sklearn.model_selection import StratifiedKFold
+    tr, va, _ = resolve_records(cfg)
+    all_recs = tr + va
+    y = [r["label"] for r in all_recs]
+    skf = StratifiedKFold(n_splits=k or cfg.kfold, shuffle=True, random_state=cfg.seed)
+
+    paths, accs = [], []
+    for i, (idx_tr, idx_va) in enumerate(skf.split(all_recs, y)):
+        rec_tr = [all_recs[j] for j in idx_tr]
+        rec_va = [all_recs[j] for j in idx_va]
+        print(f"\n========== Fold {i + 1}/{skf.n_splits} "
+              f"(train={len(rec_tr)} val={len(rec_va)}) ==========")
+        path = run_training(cfg, rec_tr, rec_va, tag=f"_fold{i + 1}")
+        paths.append(path)
+        ckpt = torch_load_compat(path)
+        accs.append(float(ckpt["val_acc"]))
+
+    print("\n===== K-FOLD SUMMARY =====")
+    for i, a in enumerate(accs):
+        print(f"fold {i + 1}: val_acc={a:.4f}")
+    print(f"mean={np.mean(accs):.4f} ± {np.std(accs):.4f}")
+    return paths, accs
+
+
+# ============================================================ CLI
+def main(argv=None) -> None:
+    from dataclasses import replace
+    ap = argparse.ArgumentParser(description="เทรน DINOv2+length-fusion+ArcFace จำแนกเครื่องมือผ่าตัด")
+    ap.add_argument("--data_dir", default="dataset")
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--img_size", type=int, default=None)
+    ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default=None)
+    ap.add_argument("--kfold", type=int, default=None, help="เช่น 5 → Stratified 5-fold CV")
+    ap.add_argument("--calibration_ratio", type=float, default=None,
+                    help="cm/pixel จาก object อ้างอิง (ไม่ใส่ = ใช้ pixel)")
+    ap.add_argument("--output_dir", default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    args = ap.parse_args(argv)
+
+    overrides = {k: v for k, v in vars(args).items() if v is not None and k != "calibration_ratio"}
+    if args.calibration_ratio is not None:
+        overrides["calibration_ratio"] = args.calibration_ratio
+    cfg = replace(TrainConfig(), **overrides)
+
+    if cfg.kfold and cfg.kfold > 1:
+        run_kfold(cfg)
+    else:
+        path = run_training(cfg)
+        print("checkpoint:", path)
+
+
+if __name__ == "__main__":
+    main()
