@@ -168,7 +168,7 @@ from train import run_training, run_kfold
 
 cfg = TrainConfig(
     data_dir=DATA_DIR,
-    img_size=616,            # 616=44×14 — เต็มที่ batch 32 บน T4
+    img_size=504,            # 504=36×14 — ดีสุดจาก kNN 0.7582 (ชนะ 546/616)
     batch_size=32,
     finetune_mode="lora",     # "lora" (แนะนำ) | "partial" | "frozen"
     epochs=50,
@@ -200,7 +200,7 @@ print(f"\\nAccuracy: {metrics['accuracy']:.4f}")'''))
 cells.append(md("""## 5.5) Phase 3 — เทรน ablation 6 สูตร (baseline vs CAHM/LGMS/SEF)
 
 รันทีละสูตรแล้วเก็บ checkpoint — **ทำบน Colab แบบนี้** เพื่อวัดผลเปรียบเทียบในเซลล์ถัดไป
-แต่ละสูตร early-stop ที่ ~20-35 epoch (patience 12) | 616px batch32 บน T4 ~9-10GB — ถ้า OOM จะลด batch เหลือ 16 อัตโนมัติ
+แต่ละสูตร early-stop ที่ ~20-35 epoch (patience 12) | 504px batch32 บน T4 ~7-8GB — ถ้า OOM จะลด batch เหลือ 16 อัตโนมัติ
 """))
 cells.append(code('''from config import TrainConfig
 from train import run_training
@@ -220,7 +220,7 @@ for name, extra in ablation.items():
     print(f"\\n{'='*20} {name} {extra} {'='*20}")
     cfg_ab = TrainConfig(
         data_dir=DATA_DIR,
-        img_size=616, batch_size=32,
+        img_size=504, batch_size=32,
         finetune_mode="lora", epochs=50, num_workers=2,
         output_dir=f"outputs_ablation/{name}",
         **extra
