@@ -196,6 +196,71 @@ cells.append(code('''from evaluate import evaluate_checkpoint
 metrics = evaluate_checkpoint(best_ckpt)
 print(f"\\nAccuracy: {metrics['accuracy']:.4f}")'''))
 
+# ---------------------------------------------------------------- ablation training (Phase 3)
+cells.append(md("""## 5.5) Phase 3 — เทรน ablation 6 สูตร (baseline vs CAHM/LGMS/SEF)
+
+รันทีละสูตรแล้วเก็บ checkpoint — **ทำบน Colab แบบนี้** เพื่อวัดผลเปรียบเทียบในเซลล์ถัดไป
+แต่ละสูตร early-stop ที่ ~20-35 epoch (patience 12) | 616px batch32 บน T4 ~9-10GB — ถ้า OOM จะลด batch เหลือ 16 อัตโนมัติ
+"""))
+cells.append(code('''from config import TrainConfig
+from train import run_training
+import torch
+
+ablation = {
+    "baseline":  {},
+    "cahm":      {"use_cahm": True},
+    "lgms":      {"use_lgms": True},
+    "sef":       {"use_sef": True},
+    "cahm_lgms": {"use_cahm": True, "use_lgms": True},
+    "all":       {"use_cahm": True, "use_lgms": True, "use_sef": True},
+}
+
+ckpt_map = {}
+for name, extra in ablation.items():
+    print(f"\\n{'='*20} {name} {extra} {'='*20}")
+    cfg_ab = TrainConfig(
+        data_dir=DATA_DIR,
+        img_size=616, batch_size=32,
+        finetune_mode="lora", epochs=50, num_workers=2,
+        output_dir=f"outputs_ablation/{name}",
+        **extra
+    )
+    try:
+        ckpt = run_training(cfg_ab)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print("[OOM] ลด batch 32 → 16 แล้วลองใหม่")
+            torch.cuda.empty_cache()
+            cfg_ab.batch_size = 16
+            ckpt = run_training(cfg_ab)
+        else:
+            raise
+    ckpt_map[name] = ckpt
+    print(f"[{name}] ✅ {ckpt}")
+
+print("\\n--- ckpt_map ---")
+for k,v in ckpt_map.items():
+    print(f'{k}: \"{v}\"')'''))
+
+cells.append(md("""## 5.6) เปรียบเทียบ ablation — ตาราง Phase 3
+
+วัด Val Acc / Balanced Acc / Needle_Holder↔Artery_Forceps error พร้อมกัน 6 สูตร
+ผ่านไฟล์ `tools/evaluate_ablation.py` (รันได้ทั้งใน notebook และ CLI)
+"""))
+cells.append(code('''from tools.evaluate_ablation import compare_checkpoints
+
+# ใช้ ckpt_map จากเซลล์ก่อนหน้า ถ้ายังไม่ได้รัน ablation ให้ใส่ path เองได้:
+# ckpt_map = {
+#     "baseline": "outputs_ablation/baseline/best_model.pt",
+#     "cahm": "outputs_ablation/cahm/best_model.pt",
+#     ...
+# }
+results = compare_checkpoints(ckpt_map, data_dir=DATA_DIR, save_csv="outputs_ablation/ablation_results.csv")
+print("\\n--- สรุป --")
+for r in results:
+    if r.get("found"):
+        print(f'{r["name"]:12s} acc={r["accuracy"]:.4f} bal={r["balanced_acc"]:.4f} {r["needle_detail"]}')'''))
+
 # ---------------------------------------------------------------- inference
 cells.append(md("""## 6) Inference ทดลอง — ภาพใหม่ + mask → class + confidence"""))
 cells.append(code('''from infer import load_pipeline, predict_record
