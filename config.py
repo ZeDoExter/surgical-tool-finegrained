@@ -12,7 +12,7 @@ from typing import List, Optional
 class TrainConfig:
     # ---------------- ข้อมูล ----------------
     data_dir: str = "dataset"          # โฟลเดอร์ที่มี train/ และ valid/ (Roboflow COCO Segmentation export)
-    img_size: int = 224                # ต้องหารด้วย 14 ลงตัว (ViT patch size ของ DINOv2)
+    img_size: int = 616                # ต้องหารด้วย 14 ลงตัว (616=44×14) — DINOv2 patch 14
     val_fraction: float = 0.2          # ใช้เมื่อไม่มีโฟลเดอร์ valid/ → stratified split จาก train
     calibration_ratio: Optional[float] = None  # cm/pixel — วัดจาก object อ้างอิงที่รู้ขนาดจริง
                                                # (กล้องระยะคงที่ตลอด จึงใช้ค่าเดียวได้ทุกภาพ)
@@ -36,14 +36,27 @@ class TrainConfig:
     mixup_alpha: float = 0.4           # Mixup alpha สำหรับ regularization (0.0 = ปิด)
                                       # ยิ่งน้อยยิ่งแรง, 0.4 เหมาะกับ ~30 samples/class
     use_tta: bool = True               # เปิด TTA ตอน inference (flip + multi-scale)
+    # ---------------- SEF (Scharr Edge Fusion) ----------------
+    use_sef: bool = False                # เปิด Scharr edge branch (เพิ่ม 64-dim edge feature)
 
     # ---------------- ArcFace ----------------
     margin: float = 28.6               # additive angular margin หน่วย "องศา" (≈ 0.5 rad)
                                        # — pytorch-metric-learning รับหน่วยองศาแล้วแปลงเป็นเรเดียนเอง
     scale: float = 64.0                # s: ขยาย cosine ก่อน softmax เพื่อไม่ให้ gradient แบน
 
+    # ---------------- CAHM (Confusion-Aware Hard Mining) ----------------
+    use_cahm: bool = False
+    cahm_alpha: float = 2.0            # น้ำหนักเสริมสำหรับคู่สับสน
+    cahm_beta: float = 0.9             # EMA smoothing ของ difficulty score
+    cahm_start_epoch: int = 10         # เริ่มใช้หลัง epoch นี้ (ให้ confusion นิ่งก่อน)
+
+    # ---------------- LGMS (Length-Gated Margin Scaling) ----------------
+    use_lgms: bool = False
+    lgms_gamma: float = 10.0           # องศาเพิ่มสูงสุดสำหรับ margin ของ class ที่ length ใกล้กัน
+    lgms_k: int = 2                    # จำนวน twin classes ที่ใกล้ที่สุด
+
     # ---------------- การเทรน ----------------
-    batch_size: int = 16
+    batch_size: int = 32               # เต็มที่ T4 15GB (616px + DINOv2-S + LoRA)
     epochs: int = 50
     patience: int = 12                 # early stopping: stop when val accuracy stops improving for N epochs
     lr_head: float = 3e-4              # learning rate ของ fusion head

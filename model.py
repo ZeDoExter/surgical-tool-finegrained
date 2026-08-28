@@ -19,11 +19,19 @@ v2 changes:
 """
 from typing import List, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import Dinov2Model
+
+try:
+    from edge_branch import ScharrEdgeBranch
+    _EDGE_AVAILABLE = True
+except ImportError:
+    ScharrEdgeBranch = None  # type: ignore
+    _EDGE_AVAILABLE = False
 
 try:
     from peft import LoraConfig, TaskType, get_peft_model
@@ -118,13 +126,16 @@ class SurgicalDinoFusion(nn.Module):
                  lora_dropout: float = 0.1,
                  partial_last_blocks: int = 2,
                  head_dropout: float = 0.1,
-                 use_attention_pool: bool = True):
+                 use_attention_pool: bool = True,
+                 use_sef: bool = False,
+                 sef_out_dim: int = 64):
         super().__init__()
         assert finetune_mode in ("frozen", "partial", "lora"), f"mode ไม่ถูกต้อง: {finetune_mode}"
 
         self.backbone = Dinov2Model.from_pretrained(backbone_name)
         self.embed_dim = self.backbone.config.hidden_size  # 384 สำหรับ dinov2-small
         self.use_attention_pool = use_attention_pool
+        self.use_sef = use_sef
 
         if finetune_mode == "lora":
             if not _PEFT_AVAILABLE:
@@ -151,8 +162,15 @@ class SurgicalDinoFusion(nn.Module):
 
         # Attention pooling: aggregate patch tokens → 384-dim
         self.attn_pool = AttentionPooling(self.embed_dim, num_heads=6, dropout=head_dropout) if use_attention_pool else None
-        # Deep fusion head: concat(384+1) → project กลับเป็น 384
-        self.fusion = DeepFusionHead(self.embed_dim, aux_dim=1, dropout=head_dropout)
+        # SEF branch (ถ้าเปิด)
+        self.edge_branch = None
+        if use_sef:
+            if not _EDGE_AVAILABLE:
+                raise ImportError("use_sef=True requires edge_branch.py")
+            self.edge_branch = ScharrEdgeBranch(out_dim=sef_out_dim, dropout=head_dropout)
+        # Deep fusion head: concat(384 + 1 + 64_if_sef) → 384
+        aux_dim = 1 + (sef_out_dim if use_sef else 0)
+        self.fusion = DeepFusionHead(self.embed_dim, aux_dim=aux_dim, dropout=head_dropout)
 
     def _freeze_partial(self, k: int) -> None:
         """freeze ทั้ง backbone แล้วปลดล็อกเฉพาะ k block ท้าย + final layernorm"""
@@ -164,9 +182,11 @@ class SurgicalDinoFusion(nn.Module):
         for p in self.backbone.layernorm.parameters():
             p.requires_grad = True
 
-    def forward(self, pixel_values: torch.Tensor, length_feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, length_feat: torch.Tensor,
+                edge_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         pixel_values: (B,3,H,W) normalize แล้ว | length_feat: (B,) normalized length
+        edge_map: (B,1,H,W) Scharr edge [0,1] ถ้า use_sef=True — ถ้า None จะใช้ศูนย์แทน
         return: embedding (B, embed_dim=384) สำหรับเข้า ArcFace loss
         """
         out = self.backbone(pixel_values=pixel_values).last_hidden_state  # (B, tokens, 384)
@@ -175,26 +195,31 @@ class SurgicalDinoFusion(nn.Module):
             e = self.attn_pool(out)        # (B, 384)
         else:
             e = out[:, 0]                   # CLS token fallback
-        # Fusion: concat visual embedding + length scalar → project
-        aux = length_feat.unsqueeze(1)      # (B, 1)
+        # Fusion: concat visual embedding + length scalar (+ edge 64 ถ้า SEF)
+        if self.use_sef and self.edge_branch is not None and edge_map is not None:
+            ef = self.edge_branch(edge_map)  # (B, 64)
+            aux = torch.cat([length_feat.unsqueeze(1), ef], dim=1)  # (B, 65)
+        else:
+            aux = length_feat.unsqueeze(1)      # (B, 1)
         return self.fusion(e, aux)          # (B, 384)
 
     def param_groups(self, lr_head: float, lr_backbone: Optional[float] = None) -> List[dict]:
         """
         แยกกลุ่มพารามิเตอร์เพื่อใช้ learning rate ต่างกัน:
-          - head (attention_pool + fusion): lr_head
+          - head (attention_pool + fusion + edge_branch): lr_head
           - backbone ที่ requires_grad=True (LoRA adapter หรือ block ที่ปลดล็อก): lr_backbone
         """
         head_params = []
         if self.attn_pool is not None:
             head_params += list(self.attn_pool.parameters())
         head_params += list(self.fusion.parameters())
+        if self.edge_branch is not None:
+            head_params += list(self.edge_branch.parameters())
         groups = [{"params": [p for p in head_params if p.requires_grad], "lr": lr_head}]
         bb_trainable = [p for p in self.backbone.parameters() if p.requires_grad]
         if bb_trainable:
             groups.append({"params": bb_trainable, "lr": lr_backbone if lr_backbone is not None else lr_head})
         return groups
-
 
 def arcface_logits(loss_fn, embeddings: torch.Tensor) -> torch.Tensor:
     """
@@ -206,6 +231,86 @@ def arcface_logits(loss_fn, embeddings: torch.Tensor) -> torch.Tensor:
     """
     cos = loss_fn.get_cosine(embeddings)  # (B, num_classes), cos ของมุมระหว่างเวกเตอร์
     return cos * loss_fn.scale
+
+
+class AdaptiveArcFaceLoss(torch.nn.Module):
+    """
+    ArcFace แบบ per-class margin (สำหรับ LGMS)
+
+    margin_per_class: list/array ขนาด num_classes หน่วยองศา
+    แต่ละ sample ใช้ margin ของ label ตัวเอง
+    """
+    def __init__(self, num_classes: int, embedding_size: int,
+                 margin_per_class: List[float], scale: float = 64.0):
+        super().__init__()
+        from pytorch_metric_learning.distances import CosineSimilarity
+        from pytorch_metric_learning.utils import common_functions as c_f
+        self.num_classes = num_classes
+        self.embedding_size = embedding_size
+        self.scale = scale
+        self.margin_per_class = np.array(margin_per_class, dtype=np.float64)
+        self.margins_rad = np.radians(self.margin_per_class)
+        self.W = torch.nn.Parameter(torch.Tensor(embedding_size, num_classes))
+        # Xavier init เหมือน pytorch-metric-learning
+        torch.nn.init.xavier_uniform_(self.W)
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
+        self._cosine = CosineSimilarity()
+        self._c_f = c_f
+
+    def get_cosine(self, embeddings: torch.Tensor) -> torch.Tensor:
+        # Follows pytorch-metric-learning: normalize embeddings and W
+        emb_norm = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        W_norm = torch.nn.functional.normalize(self.W, p=2, dim=0)
+        return torch.mm(emb_norm, W_norm)
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        คืน loss เฉลี่ย (mean) — เรียก compute_loss แบบ per-sample แล้ว mean เอง
+        เพื่อให้ CAHM นำไป weight ต่อได้ (ถ้าต้องการ per-sample loss ให้เรียก compute_loss_dict)
+        """
+        d = self.compute_loss_dict(embeddings, labels)
+        return d["losses"].mean()
+
+    def compute_loss_dict(self, embeddings: torch.Tensor, labels: torch.Tensor) -> dict:
+        """
+        คืน dict {"losses": (B,) per-sample, "logits": (B,C)}
+        สำหรับ CAHM ที่ต้อง weight ราย sample
+        """
+        dtype, device = embeddings.dtype, embeddings.device
+        # ย้าย W/margins ให้ตรง device/dtype
+        W = self._c_f.to_device(self.W, device=device, dtype=dtype)
+        margins = torch.as_tensor(self.margins_rad, device=device, dtype=dtype)  # (C,)
+        # cosine (B, C)
+        cosine = self.get_cosine(embeddings)  # internal uses self.W — need to ensure uses moved W; get_cosine uses normalized W directly
+        # แต่ get_cosine ดู self.W เอง — override ให้ใช้ W ที่ย้ายแล้วไม่ได้; ทำ manual:
+        emb_norm = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        W_norm = torch.nn.functional.normalize(W, p=2, dim=0)
+        cosine = torch.mm(emb_norm, W_norm)
+        # mask
+        B = labels.size(0)
+        mask = torch.zeros(B, self.num_classes, dtype=dtype, device=device)
+        mask[torch.arange(B, device=device), labels] = 1
+        cosine_target = cosine[mask == 1]  # (B,)
+        angles = torch.acos(torch.clamp(cosine_target, -1 + 1e-7, 1 - 1e-7))
+        m_per_sample = margins[labels]  # (B,)
+        # cos(theta + m) แบบ ArcFace
+        cos_theta_plus_m = torch.cos(angles + m_per_sample)
+        cos_theta = torch.cos(angles)
+        # keep monotonically decreasing (เช่นเดียวกับ ArcFace)
+        # ถ้า theta + m > pi ให้ fallback
+        cond = angles <= (np.pi - m_per_sample)
+        # m ใน radian ต้องแปลงเป็น tensor สำหรับ sin
+        modified = torch.where(cond, cos_theta_plus_m, cos_theta - m_per_sample * torch.sin(torch.as_tensor(m_per_sample)))
+        diff = (modified - cosine_target).unsqueeze(1)  # (B,1)
+        logits = cosine + (mask * diff)
+        logits = logits * self.scale
+        losses = self.cross_entropy(logits, labels)  # (B,)
+        return {"losses": losses, "logits": logits, "cosine": cosine}
+
+    # ให้เหมือน pytorch-metric-learning: มี attribute W และ scale สำหรับ arcface_logits
+    @property
+    def W_t(self):
+        return self.W.t()
 
 
 def count_trainable(model: nn.Module) -> int:

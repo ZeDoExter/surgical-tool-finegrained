@@ -26,9 +26,10 @@ from torch.utils.data import DataLoader
 from pytorch_metric_learning.losses import ArcFaceLoss
 
 from config import TrainConfig
-from dataset import (SurgicalInstrumentDataset, compute_length_stats,
+from dataset import (SurgicalInstrumentDataset, compute_class_length_means,
+                     compute_length_stats, compute_lgms_margins,
                      load_coco_records, stratified_split)
-from model import SurgicalDinoFusion, arcface_logits, count_trainable
+from model import AdaptiveArcFaceLoss, SurgicalDinoFusion, arcface_logits, count_trainable
 
 
 # ============================================================ utils
@@ -91,7 +92,6 @@ def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]
         print(f"[data] ไม่มีโฟลเดอร์ valid/ → stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
     return tr, va, classes
 
-
 def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
     """LR schedule: linear warmup → cosine decay ลงจนเกือบ 0 ตอนจบ"""
     if step < warmup:
@@ -100,19 +100,76 @@ def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
     return 0.5 * (1.0 + math.cos(math.pi * t))
 
 
-# ============================================================ epochs
-def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device, cfg) -> float:
-    """เทรน 1 epoch → คืนค่า loss เฉลี่ย (ArcFace บน embedding จาก fusion head)"""
-    model.train()
-    total, seen = 0.0, 0
-    mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
+# ============================================================ CAHM helpers
+def _cahm_d_from_cm(cm: np.ndarray) -> np.ndarray:
+    """
+    คำนวณ pair difficulty จาก confusion matrix:
+      d(i,j) = C[i,j] + C[j,i]  (i!=j), normalize ด้วย max
+    """
+    C = cm.astype(np.float64)
+    n = C.shape[0]
+    d = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                d[i, j] = C[i, j] + C[j, i]
+    m = d.max()
+    if m > 1e-9:
+        d = d / m
+    return d
+
+
+def _cahm_weights(labels: torch.Tensor, d_t: np.ndarray, alpha: float, device) -> torch.Tensor:
+    """w = 1 + alpha * max_j d_t[y,j]  (per-sample)"""
+    if d_t is None:
+        return torch.ones_like(labels, dtype=torch.float32)
+    d = torch.as_tensor(d_t, device=device, dtype=torch.float32)  # (C,C)
+    # max ต่อแถว (ไม่นับ diagonal ที่เป็น 0 อยู่แล้ว)
+    row_max = d.max(dim=1).values  # (C,)
+    w = 1.0 + alpha * row_max[labels]
+    return w
+
+
+@torch.no_grad()
+def _eval_confusion(model, loss_fn, loader, device, num_classes: int) -> np.ndarray:
+    """รันทั้ง validation set เพื่อสร้าง confusion matrix สำหรับ CAHM"""
+    from sklearn.metrics import confusion_matrix
+    model.eval()
+    ys_true, ys_pred = [], []
     for batch in loader:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
+        edge = batch.get("edge_map")
+        if edge is not None:
+            edge = edge.to(device, non_blocking=True)
+        emb = model(px, ln, edge)
+        logits = arcface_logits(loss_fn, emb.float())
+        pred = logits.argmax(dim=1).cpu().numpy()
+        ys_true.extend(y.cpu().numpy().tolist())
+        ys_pred.extend(pred.tolist())
+    cm = confusion_matrix(ys_true, ys_pred, labels=list(range(num_classes)))
+    return cm
+# ============================================================ epochs
+def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device, cfg,
+                    cahm_d: Optional[np.ndarray] = None) -> float:
+    """เทรน 1 epoch → คืนค่า loss เฉลี่ย (ArcFace บน embedding จาก fusion head)"""
+    model.train()
+    total, seen = 0.0, 0
+    mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
+    use_cahm = bool(getattr(cfg, "use_cahm", False)) and cahm_d is not None
+    cahm_alpha = float(getattr(cfg, "cahm_alpha", 2.0))
+    is_adaptive = hasattr(loss_fn, "compute_loss_dict")
+    for batch in loader:
+        px = batch["image"].to(device, non_blocking=True)
+        ln = batch["length"].to(device, non_blocking=True)
+        y = batch["label"].to(device, non_blocking=True)
+        edge = batch.get("edge_map")
+        if edge is not None:
+            edge = edge.to(device, non_blocking=True)
 
         # Mixup: สุ่ม interpolate ข้อมูล 2 ตัวอย่าง (regularization สำหรับข้อมูลน้อย)
-        use_mixup = mixup_alpha > 0 and model.training
+        use_mixup = mixup_alpha > 0 and model.training and not use_cahm  # ปิด mixup เมื่อใช้ CAHM เพื่อให้ weight ชัดเจน
         if use_mixup:
             px, y_a, y_b, lam = mixup_data(px, y, mixup_alpha)
         else:
@@ -121,9 +178,21 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:  # GPU → mixed precision
             with torch.autocast("cuda"):
-                emb = model(px, ln)
+                emb = model(px, ln, edge)
                 if use_mixup:
                     loss = lam * loss_fn(emb.float(), y_a) + (1 - lam) * loss_fn(emb.float(), y_b)
+                elif use_cahm:
+                    # CAHM weighted loss — ดึง per-sample loss แล้วคูณ w
+                    if is_adaptive:
+                        d = loss_fn.compute_loss_dict(emb.float(), y)
+                        per = d["losses"]  # (B,)
+                    else:
+                        # ต้องส่ง ref_emb = embeddings เพื่อผ่าน identity check ของ PML
+                        ef = emb.float()
+                        ld = loss_fn.compute_loss(ef, y, None, ef, y)
+                        per = ld["loss"]["losses"]  # (B,)
+                    w = _cahm_weights(y, cahm_d, cahm_alpha, device)
+                    loss = (per * w).mean()
                 else:
                     loss = loss_fn(emb.float(), y)  # cast fp32 ก่อนเข้า ArcFace เพื่อ stability
             scaler.scale(loss).backward()
@@ -132,9 +201,19 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
             scaler.step(optimizer)
             scaler.update()
         else:  # CPU → fp32
-            emb = model(px, ln)
+            emb = model(px, ln, edge)
             if use_mixup:
                 loss = lam * loss_fn(emb, y_a) + (1 - lam) * loss_fn(emb, y_b)
+            elif use_cahm:
+                if is_adaptive:
+                    d = loss_fn.compute_loss_dict(emb.float(), y)
+                    per = d["losses"]
+                else:
+                    ef = emb.float()
+                    ld = loss_fn.compute_loss(ef, y, None, ef, y)
+                    per = ld["loss"]["losses"]
+                w = _cahm_weights(y, cahm_d, cahm_alpha, device)
+                loss = (per * w).mean()
             else:
                 loss = loss_fn(emb, y)
             loss.backward()
@@ -159,14 +238,16 @@ def validate(model, loss_fn, loader, device) -> Tuple[float, float]:
     for batch in loader:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
-        embs.append(model(px, ln).float().cpu())
+        edge = batch.get("edge_map")
+        if edge is not None:
+            edge = edge.to(device, non_blocking=True)
+        embs.append(model(px, ln, edge).float().cpu())
         ys.append(batch["label"])
     E = torch.cat(embs).to(device)
     Y = torch.cat(ys).to(device)
     loss = loss_fn(E, Y).item()
     acc = (arcface_logits(loss_fn, E).argmax(dim=1) == Y).float().mean().item()
     return loss, acc
-
 
 def save_history_plot(history: dict, out_png: str) -> None:
     """วาดกราฟ loss/accuracy — fail ได้ (headless) โดยไม่ทำ training ล้ม"""
@@ -213,33 +294,41 @@ def run_training(cfg: TrainConfig,
           f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
 
     flip_flags = build_flip_flags(class_names, cfg)
+    use_sef = bool(getattr(cfg, "use_sef", False))
     ds_train = SurgicalInstrumentDataset(records_train, length_stats, cfg.img_size,
                                          cfg.calibration_ratio, flip_flags, training=True,
-                                         bbox_margin=cfg.bbox_margin)
+                                         bbox_margin=cfg.bbox_margin, use_sef=use_sef)
     ds_val = SurgicalInstrumentDataset(records_valid, length_stats, cfg.img_size,
                                        cfg.calibration_ratio, flip_flags=None, training=False,
-                                       bbox_margin=cfg.bbox_margin)
+                                       bbox_margin=cfg.bbox_margin, use_sef=use_sef)
     pin = device.type == "cuda"
     dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
                           num_workers=cfg.num_workers, pin_memory=pin)
     dl_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False,
                         num_workers=cfg.num_workers, pin_memory=pin)
-
     # ---------- โมเดล + loss ----------
     model = SurgicalDinoFusion(
         backbone_name=cfg.backbone_name, finetune_mode=cfg.finetune_mode,
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
         partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
+        use_sef=use_sef,
     ).to(device)
-    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode})")
+    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode}, sef={use_sef})")
 
-    # ArcFace: margin หน่วยองศา (~28.6° = 0.5 rad), s=64 — บังคับ embedding ให้
-    # intra-class แน่น / inter-class ห่าง เหมาะกับ class ที่รูปทรงใกล้กันมาก
-    loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
-                          margin=cfg.margin, scale=cfg.scale).to(device)
-
-    # ---------- optimizer + LR schedule (warmup → cosine) ----------
+    # ArcFace — ปกติหรือ LGMS (per-class margin)
+    if bool(getattr(cfg, "use_lgms", False)):
+        class_means = compute_class_length_means(records_train, cfg.calibration_ratio)
+        margins = compute_lgms_margins(class_means, len(class_names),
+                                       m_base=cfg.margin, gamma=cfg.lgms_gamma, k=cfg.lgms_k)
+        print(f"[LGMS] margins per class: {[f'{m:.1f}' for m in margins]}")
+        loss_fn = AdaptiveArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
+                                      margin_per_class=margins, scale=cfg.scale).to(device)
+    else:
+        # ArcFace: margin หน่วยองศา (~28.6° = 0.5 rad), s=64 — บังคับ embedding ให้
+        # intra-class แน่น / inter-class ห่าง เหมาะกับ class ที่รูปทรงใกล้กันมาก
+        loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
+                              margin=cfg.margin, scale=cfg.scale).to(device)
     if cfg.finetune_mode == "partial":
         lr_bb = cfg.lr_backbone
     elif cfg.finetune_mode == "lora":
@@ -266,11 +355,35 @@ def run_training(cfg: TrainConfig,
     # ArcFace val_loss กับ val_acc แย่งกัน (loss ต่ำสุด ≠ โมเดลดีที่สุด); spec เดิมให้ดู val loss
     best = {"val_loss": float("inf"), "val_acc": -1.0, "epoch": -1, "model": None, "arcface": None}
     bad_epochs = 0
+    cahm_d = None  # (C,C) EMA state สำหรับ CAHM
+    use_cahm = bool(getattr(cfg, "use_cahm", False))
+    cahm_start = int(getattr(cfg, "cahm_start_epoch", 10))
+    cahm_beta = float(getattr(cfg, "cahm_beta", 0.9))
 
     for epoch in range(1, cfg.epochs + 1):
-        tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg)
+        # ส่ง cahm_d ให้ epoch นี้ถ้าถึงเวลาเริ่มแล้ว
+        cur_cahm = cahm_d if (use_cahm and epoch > cahm_start and cahm_d is not None) else None
+        tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg, cahm_d=cur_cahm)
         vl, va = validate(model, loss_fn, dl_val, device)
         history["train_loss"].append(tl); history["val_loss"].append(vl); history["val_acc"].append(va)
+
+        # CAHM: อัปเดต difficulty หลัง validate (ใช้สำหรับ epoch ถัดไป)
+        if use_cahm and epoch >= cahm_start:
+            try:
+                cm = _eval_confusion(model, loss_fn, dl_val, device, len(class_names))
+                d_cur = _cahm_d_from_cm(cm)
+                if cahm_d is None:
+                    cahm_d = d_cur
+                else:
+                    cahm_d = cahm_beta * cahm_d + (1 - cahm_beta) * d_cur
+                # log คู่สับสน top1 สำหรับดีบัก
+                flat = [(i, j, cahm_d[i, j]) for i in range(len(class_names)) for j in range(len(class_names)) if i != j]
+                flat.sort(key=lambda x: -x[2])
+                if flat:
+                    i, j, v = flat[0]
+                    print(f"  [CAHM] top confused: {class_names[i]}↔{class_names[j]} d={v:.3f}")
+            except Exception as e:
+                print(f"  [CAHM] skip update: {e}")
 
         improved = va > best["val_acc"] + 1e-4 or \
             (va >= best["val_acc"] - 1e-4 and vl < best["val_loss"] - 1e-4)
@@ -373,13 +486,29 @@ def main(argv=None) -> None:
                     help="cm/pixel จาก object อ้างอิง (ไม่ใส่ = ใช้ pixel)")
     ap.add_argument("--output_dir", default=None)
     ap.add_argument("--seed", type=int, default=None)
+    # CAHM / LGMS / SEF — เปิด/ปิดอัลกอริทึมเสริม
+    ap.add_argument("--use_cahm", action="store_true", help="เปิด CAHM (confusion-aware hard mining)")
+    ap.add_argument("--use_lgms", action="store_true", help="เปิด LGMS (length-gated margin scaling)")
+    ap.add_argument("--use_sef", action="store_true", help="เปิด SEF (Scharr edge fusion)")
+    ap.add_argument("--cahm_alpha", type=float, default=None)
+    ap.add_argument("--cahm_beta", type=float, default=None)
+    ap.add_argument("--lgms_gamma", type=float, default=None)
+    ap.add_argument("--lgms_k", type=int, default=None)
     args = ap.parse_args(argv)
 
-    overrides = {k: v for k, v in vars(args).items() if v is not None and k != "calibration_ratio"}
+    overrides = {}
+    for k, v in vars(args).items():
+        if k == "calibration_ratio":
+            continue
+        if v is None:
+            continue
+        # store_true flags: False หมายถึงไม่ใส่ → ไม่ override (คงค่าเดิม False)
+        if isinstance(v, bool) and not v:
+            continue
+        overrides[k] = v
     if args.calibration_ratio is not None:
         overrides["calibration_ratio"] = args.calibration_ratio
     cfg = replace(TrainConfig(), **overrides)
-
     if cfg.kfold and cfg.kfold > 1:
         run_kfold(cfg)
     else:

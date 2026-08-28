@@ -42,6 +42,7 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
         partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
+        use_sef=bool(getattr(cfg, "use_sef", False)),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
@@ -49,7 +50,12 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
     classes: List[str] = ckpt["classes"]
     arcface = ArcFaceLoss(num_classes=len(classes), embedding_size=model.embed_dim,
                           margin=cfg.margin, scale=cfg.scale)
-    arcface.load_state_dict(ckpt["arcface_state"])
+    try:
+        arcface.load_state_dict(ckpt["arcface_state"])
+    except Exception:
+        # ถ้าเทรนด้วย LGMS (AdaptiveArcFace) แต่ประเมินด้วย ArcFace ปกติ — W ยังโหลดได้
+        # ลองโหลดแบบ strict=False
+        arcface.load_state_dict(ckpt["arcface_state"], strict=False)
     arcface.to(device)
 
     return {"model": model, "arcface": arcface, "classes": classes, "cfg": cfg,
@@ -57,22 +63,26 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
             "length_mean": float(ckpt["length_mean"]), "length_std": float(ckpt["length_std"]),
             "calibration_ratio": ckpt.get("calibration_ratio")}
 
-
 @torch.no_grad()
 def predict_all(bundle: dict, records: List[dict]):
     """รันทั้ง validation set → (y_true, y_pred, confidence ของ class ที่ทำนาย)"""
     cfg = bundle["cfg"]
     device = bundle["device"]
     length_stats = (bundle["length_mean"], bundle["length_std"])
+    use_sef = bool(getattr(cfg, "use_sef", False))
     ds = SurgicalInstrumentDataset(records, length_stats, cfg.img_size,
                                    cfg.calibration_ratio, flip_flags=None, training=False,
-                                   bbox_margin=getattr(cfg, "bbox_margin", 0.0))
+                                   bbox_margin=getattr(cfg, "bbox_margin", 0.0),
+                                   use_sef=use_sef)
     dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
     y_true, y_pred, y_conf = [], [], []
     for batch in dl:
         px = batch["image"].to(device)
         ln = batch["length"].to(device)
-        emb = bundle["model"](px, ln)
+        edge = batch.get("edge_map")
+        if edge is not None:
+            edge = edge.to(device)
+        emb = bundle["model"](px, ln, edge)
         logits = arcface_logits(bundle["arcface"], emb.float())
         probs = torch.softmax(logits, dim=-1)
         conf, pred = probs.max(dim=-1)
