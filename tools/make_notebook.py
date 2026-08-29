@@ -183,10 +183,12 @@ cfg = TrainConfig(
     finetune_mode="lora",     # "lora" (recommended) | "partial" | "frozen"
     epochs=50,
     num_workers=2,
+    use_cahm=True,            # CAHM on by default — from ablation: 0.9590 vs baseline 0.9467, Needle 8→3
     # ---- optional extras ----
     # calibration_ratio=CALIB_RATIO,
     # flip_allowed=["class_a", "class_b"],  # only classes that may be flipped (others are not flipped)
     # kfold=5,                              # Stratified 5-fold CV
+    # use_cahm=False,  # to run baseline without CAHM
 )
 
 if cfg.kfold:
