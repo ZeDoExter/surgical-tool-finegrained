@@ -2,8 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 outputs/
+outputs_ablation/
+ablation/
 dataset/
+colab_upload/
 *.pt
 *.pth
+*.zip
 .DS_Store
 .ipynb_checkpoints/
