@@ -29,12 +29,8 @@ from torch.utils.data import DataLoader
 
 from pytorch_metric_learning.losses import ArcFaceLoss
 
-from config import TrainConfig
-from dataset import (SurgicalInstrumentDataset, compute_class_length_means,
-                     compute_length_stats, compute_lgms_margins,
-                     load_coco_records, stratified_split)
-from model import AdaptiveArcFaceLoss, SurgicalDinoFusion, arcface_logits, count_trainable
-
+from dataset import SurgicalInstrumentDataset, compute_length_stats, load_coco_records, stratified_split
+from model import SurgicalDinoFusion, arcface_logits, count_trainable
 
 # ============================================================ utils
 def seed_everything(seed: int) -> None:
@@ -144,10 +140,7 @@ def _eval_confusion(model, loss_fn, loader, device, num_classes: int) -> np.ndar
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
-        edge = batch.get("edge_map")
-        if edge is not None:
-            edge = edge.to(device, non_blocking=True)
-        emb = model(px, ln, edge)
+        emb = model(px, ln)
         logits = arcface_logits(loss_fn, emb.float())
         pred = logits.argmax(dim=1).cpu().numpy()
         ys_true.extend(y.cpu().numpy().tolist())
@@ -163,15 +156,10 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
     mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
     use_cahm = bool(getattr(cfg, "use_cahm", False)) and cahm_d is not None
     cahm_alpha = float(getattr(cfg, "cahm_alpha", 2.0))
-    is_adaptive = hasattr(loss_fn, "compute_loss_dict")
     for batch in loader:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
-        edge = batch.get("edge_map")
-        if edge is not None:
-            edge = edge.to(device, non_blocking=True)
-
         # Mixup: randomly interpolate between 2 samples (regularization for small datasets)
         use_mixup = mixup_alpha > 0 and model.training and not use_cahm  # disable mixup when using CAHM so weights remain clear
         if use_mixup:
@@ -182,19 +170,15 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:  # GPU → mixed precision
             with torch.autocast("cuda"):
-                emb = model(px, ln, edge)
+                emb = model(px, ln)
                 if use_mixup:
                     loss = lam * loss_fn(emb.float(), y_a) + (1 - lam) * loss_fn(emb.float(), y_b)
                 elif use_cahm:
                     # CAHM weighted loss — retrieve per-sample loss and multiply by w
-                    if is_adaptive:
-                        d = loss_fn.compute_loss_dict(emb.float(), y)
-                        per = d["losses"]  # (B,)
-                    else:
-                        # must pass ref_emb = embeddings to pass PML identity check
-                        ef = emb.float()
-                        ld = loss_fn.compute_loss(ef, y, None, ef, y)
-                        per = ld["loss"]["losses"]  # (B,)
+                    # must pass ref_emb = embeddings to pass PML identity check
+                    ef = emb.float()
+                    ld = loss_fn.compute_loss(ef, y, None, ef, y)
+                    per = ld["loss"]["losses"]  # (B,)
                     w = _cahm_weights(y, cahm_d, cahm_alpha, device)
                     loss = (per * w).mean()
                 else:
@@ -205,17 +189,13 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
             scaler.step(optimizer)
             scaler.update()
         else:  # CPU → fp32
-            emb = model(px, ln, edge)
+            emb = model(px, ln)
             if use_mixup:
                 loss = lam * loss_fn(emb, y_a) + (1 - lam) * loss_fn(emb, y_b)
             elif use_cahm:
-                if is_adaptive:
-                    d = loss_fn.compute_loss_dict(emb.float(), y)
-                    per = d["losses"]
-                else:
-                    ef = emb.float()
-                    ld = loss_fn.compute_loss(ef, y, None, ef, y)
-                    per = ld["loss"]["losses"]
+                ef = emb.float()
+                ld = loss_fn.compute_loss(ef, y, None, ef, y)
+                per = ld["loss"]["losses"]
                 w = _cahm_weights(y, cahm_d, cahm_alpha, device)
                 loss = (per * w).mean()
             else:
@@ -242,10 +222,7 @@ def validate(model, loss_fn, loader, device) -> Tuple[float, float]:
     for batch in loader:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
-        edge = batch.get("edge_map")
-        if edge is not None:
-            edge = edge.to(device, non_blocking=True)
-        embs.append(model(px, ln, edge).float().cpu())
+        embs.append(model(px, ln).float().cpu())
         ys.append(batch["label"])
     E = torch.cat(embs).to(device)
     Y = torch.cat(ys).to(device)
@@ -298,13 +275,12 @@ def run_training(cfg: TrainConfig,
           f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
 
     flip_flags = build_flip_flags(class_names, cfg)
-    use_sef = bool(getattr(cfg, "use_sef", False))
     ds_train = SurgicalInstrumentDataset(records_train, length_stats, cfg.img_size,
                                          cfg.calibration_ratio, flip_flags, training=True,
-                                         bbox_margin=cfg.bbox_margin, use_sef=use_sef)
+                                         bbox_margin=cfg.bbox_margin)
     ds_val = SurgicalInstrumentDataset(records_valid, length_stats, cfg.img_size,
                                        cfg.calibration_ratio, flip_flags=None, training=False,
-                                       bbox_margin=cfg.bbox_margin, use_sef=use_sef)
+                                       bbox_margin=cfg.bbox_margin)
     pin = device.type == "cuda"
     dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
                           num_workers=cfg.num_workers, pin_memory=pin)
@@ -316,23 +292,13 @@ def run_training(cfg: TrainConfig,
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
         partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
-        use_sef=use_sef,
     ).to(device)
-    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode}, sef={use_sef})")
+    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode})")
 
-    # ArcFace — standard or LGMS (per-class margin)
-    if bool(getattr(cfg, "use_lgms", False)):
-        class_means = compute_class_length_means(records_train, cfg.calibration_ratio)
-        margins = compute_lgms_margins(class_means, len(class_names),
-                                       m_base=cfg.margin, gamma=cfg.lgms_gamma, k=cfg.lgms_k)
-        print(f"[LGMS] margins per class: {[f'{m:.1f}' for m in margins]}")
-        loss_fn = AdaptiveArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
-                                      margin_per_class=margins, scale=cfg.scale).to(device)
-    else:
-        # ArcFace: margin in degrees (~28.6° = 0.5 rad), s=64 — forces embeddings to have
-        # tight intra-class / wide inter-class separation, suitable for classes with very similar shapes
-        loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
-                              margin=cfg.margin, scale=cfg.scale).to(device)
+    # ArcFace: margin in degrees (~28.6° = 0.5 rad), s=64 — forces embeddings to have
+    # tight intra-class / wide inter-class separation, suitable for classes with very similar shapes
+    loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
+                          margin=cfg.margin, scale=cfg.scale).to(device)
     if cfg.finetune_mode == "partial":
         lr_bb = cfg.lr_backbone
     elif cfg.finetune_mode == "lora":
@@ -490,14 +456,10 @@ def main(argv=None) -> None:
                     help="cm/pixel from reference object (omit = use pixels)")
     ap.add_argument("--output_dir", default=None)
     ap.add_argument("--seed", type=int, default=None)
-    # CAHM / LGMS / SEF — toggle auxiliary algorithms
+    # CAHM — toggle auxiliary algorithm
     ap.add_argument("--use_cahm", action="store_true", help="enable CAHM (confusion-aware hard mining)")
-    ap.add_argument("--use_lgms", action="store_true", help="enable LGMS (length-gated margin scaling)")
-    ap.add_argument("--use_sef", action="store_true", help="enable SEF (Scharr edge fusion)")
     ap.add_argument("--cahm_alpha", type=float, default=None)
     ap.add_argument("--cahm_beta", type=float, default=None)
-    ap.add_argument("--lgms_gamma", type=float, default=None)
-    ap.add_argument("--lgms_k", type=int, default=None)
     args = ap.parse_args(argv)
 
     overrides = {}

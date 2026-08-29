@@ -1,6 +1,6 @@
 # Algorithm — Surgical-Tool Fine-grained Classification
 
-> Short, runnable — baseline first, then why the three add-ons are added
+> Short, runnable — baseline first, then why the kept add-on is added
 
 ---
 
@@ -11,7 +11,7 @@ COCO (image + polygon) ──► Dataset ──► Model(baseline) ──► Los
                               │              │               │         │
                     kNN probe (frozen)   length(1)     ArcFace    Evaluate / Infer
                                             │
-                         Add-ons (enable when needed): CAHM | LGMS | SEF
+                         Kept add-on: CAHM (LGMS/SEF tried and removed — see ablation)
 ```
 
 **Input:** image on green cloth + polygon mask for 1 instrument → **Output:** class name (14) + confidence  
@@ -81,13 +81,13 @@ TTA: (logits + logits_flip)/2 if use_tta
 
 ---
 
-## 2) Three Add-ons — why they are added
+## 2) Kept Add-on — why it is added
 
-Baseline already runs end-to-end — the three below are enabled only to fix remaining errors (mostly Needle↔Artery)
+Baseline already runs end-to-end — the add-on below is enabled by default to fix the remaining clustered error (Needle↔Artery)
 
-### 2.1 CAHM — Confusion-Aware Hard Mining (`use_cahm`)
+### 2.1 CAHM — Confusion-Aware Hard Mining (`use_cahm=True` by default)
 
-**Why:** make loss focus on pairs the model confuses often
+**Why:** make loss focus on pairs the model confuses often (Needle↔Artery 8→3)
 
 **How:**
 ```
@@ -98,37 +98,19 @@ loss = mean( per_sample_loss * w )
 # mixup is disabled when CAHM is on
 ```
 
-### 2.2 LGMS — Length-Gated Margin Scaling (`use_lgms`)
+**Result from ablation (1032/244, 504):** baseline 0.9467 (8) → CAHM 0.9590 (3) — kept
 
-**Why:** some pairs differ only by length — give larger margin to pairs with similar length so they are pushed farther apart
+### 2.2 Tried and removed
 
-**How:**
-```
-len_mean[c] = mean length per class (from train)
-sim(i,j) = 1 - |len_i - len_j| / max_diff
-twin[y] = 2 classes with highest sim
-m(y) = 28.6 + 10 * mean(sim_y)   # γ=10°
-loss uses m(y) instead of fixed m (AdaptiveArcFaceLoss)
-```
+* **LGMS** (length-gated margin, 0.9385, 9) and **SEF** (edge branch, 0.9549, 7) were tried.  
+  `all` (0.9508, 5) did not beat CAHM alone, so they are removed from the codebase.  
+  Code, config flags, and edge branch are deleted — see git history if needed.
 
-### 2.3 SEF — Scharr Edge Fusion (`use_sef`)
-
-**Why:** green cloth + metallic instruments + shadows → low contrast — add an edge branch to emphasize shape
-
-**How:**
-```
-gray = RGB2GRAY(image after augment)
-gx = Scharr(gray, dx=1), gy = Scharr(gray, dy=1)
-edge = magnitude(gx,gy)/max → [0,1] → resize 504×504 → (1,504,504)
-edge_feat = CNN 3 layers + GAP → (B,64)
-fusion: concat(e 384, length 1, edge 64) → (B,449) → Linear → emb 384
-```
-
-**Enable/disable:** all three are flags in `config.py` — baseline has them off, enable any you need
+**Enable:** CAHM is on by default in `config.py`
 
 ```python
-cfg = TrainConfig(data_dir="dataset", img_size=504, batch_size=32,
-                  use_cahm=True)  # or use_lgms / use_sef
+cfg = TrainConfig(data_dir="dataset", img_size=504, batch_size=32)  # use_cahm=True by default
+# to run baseline: cfg = TrainConfig(..., use_cahm=False)
 ```
 
 ---
@@ -140,6 +122,7 @@ img_size=504 (36×14)
 bbox_margin=0.15
 batch_size=32 (T4) / 16 (1650 4GB fallback)
 finetune_mode=lora r=16
+use_cahm=True  # from ablation: 0.9590 vs baseline 0.9467
 # chosen from kNN probe experiments before training
 ```
 
@@ -151,7 +134,8 @@ finetune_mode=lora r=16
 1. Upload DentalInstrument_DINOv2_ArcFace.ipynb
 2. Choose DATA_DIR (Drive/zip)
 3. Run all — 3.5 probe should be ~0.75
-4. Cell 4 train baseline → 5 evaluate → 5.5 train ablation 6 configs → 5.6 compare table
+4. Cell 4 train (CAHM on by default) → 5 evaluate
+   # ablation 6 configs are removed; to reproduce, check git history
 ```
 
 See experimental results in `README.md`

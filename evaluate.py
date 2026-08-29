@@ -43,7 +43,6 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
         partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
-        use_sef=bool(getattr(cfg, "use_sef", False)),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device).eval()
@@ -70,20 +69,15 @@ def predict_all(bundle: dict, records: List[dict]):
     cfg = bundle["cfg"]
     device = bundle["device"]
     length_stats = (bundle["length_mean"], bundle["length_std"])
-    use_sef = bool(getattr(cfg, "use_sef", False))
     ds = SurgicalInstrumentDataset(records, length_stats, cfg.img_size,
                                    cfg.calibration_ratio, flip_flags=None, training=False,
-                                   bbox_margin=getattr(cfg, "bbox_margin", 0.0),
-                                   use_sef=use_sef)
+                                   bbox_margin=getattr(cfg, "bbox_margin", 0.0))
     dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
     y_true, y_pred, y_conf = [], [], []
     for batch in dl:
         px = batch["image"].to(device)
         ln = batch["length"].to(device)
-        edge = batch.get("edge_map")
-        if edge is not None:
-            edge = edge.to(device)
-        emb = bundle["model"](px, ln, edge)
+        emb = bundle["model"](px, ln)
         logits = arcface_logits(bundle["arcface"], emb.float())
         probs = torch.softmax(logits, dim=-1)
         conf, pred = probs.max(dim=-1)

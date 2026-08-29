@@ -173,59 +173,6 @@ def build_tensor_transform(img_size: int) -> A.Compose:
     ])
 
 
-def scharr_edge_map(gray: np.ndarray) -> np.ndarray:
-    """
-    Compute Scharr edge magnitude from a grayscale image (uint8) — returns float32 in [0, 1].
-    Used for the SEF branch: emphasizes edges/shape of the instrument over color.
-    """
-    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
-    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
-    mag = cv2.magnitude(gx, gy)
-    m = float(mag.max())
-    if m > 1e-6:
-        mag = mag / m
-    return mag.astype(np.float32)
-
-
-def compute_class_length_means(records: List[dict], calibration_ratio: Optional[float] = None) -> dict:
-    """Mean length per class (for LGMS) — use training records only."""
-    from collections import defaultdict
-    sums: dict = defaultdict(list)
-    for r in records:
-        mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
-        L = measure_length_px(mask)
-        if calibration_ratio is not None:
-            L *= calibration_ratio
-        sums[r["label"]].append(L)
-    return {k: float(np.mean(v)) for k, v in sums.items()}
-
-
-def compute_lgms_margins(class_means: dict, num_classes: int, m_base: float = 28.6,
-                         gamma: float = 10.0, k: int = 2) -> List[float]:
-    """
-    Compute per-class margin for LGMS.
-    sim_len(i,j) = 1 - |len_i - len_j| / max_diff
-    m(y) = m_base + gamma * mean(sim of k nearest neighbors)
-    """
-    means = np.array([class_means.get(i, 0.0) for i in range(num_classes)], dtype=np.float64)
-    if num_classes <= 1:
-        return [m_base] * num_classes
-    diff = np.abs(means[:, None] - means[None, :])  # (C,C)
-    max_diff = float(diff.max())
-    if max_diff < 1e-6:
-        return [m_base] * num_classes
-    sim = 1.0 - diff / max_diff  # 0..1, higher = more similar length
-    np.fill_diagonal(sim, -1)  # exclude self
-    margins = []
-    for y in range(num_classes):
-        # top-k most similar
-        topk_idx = np.argsort(sim[y])[::-1][:k]
-        # filter negative values (when k > C-1)
-        vals = [sim[y, j] for j in topk_idx if sim[y, j] >= 0]
-        mean_sim = float(np.mean(vals)) if vals else 0.0
-        margins.append(float(m_base + gamma * mean_sim))
-    return margins
-
 def simulate_shadow(img: np.ndarray, rng: Optional[random.Random] = None) -> np.ndarray:
     """
     Simulate "shadow" on the green cloth background — shadows shift with
@@ -310,13 +257,12 @@ class SurgicalInstrumentDataset(Dataset):
     def __init__(self, records: List[dict], length_stats: Tuple[float, float],
                  img_size: int = 224, calibration_ratio: Optional[float] = None,
                  flip_flags: Optional[List[bool]] = None, training: bool = True,
-                 bbox_margin: float = 0.0, use_sef: bool = False):
+                 bbox_margin: float = 0.0):
         self.records = records
         self.length_mean, self.length_std = length_stats
         self.training = training
         self.bbox_margin = bbox_margin
         self.img_size = img_size
-        self.use_sef = use_sef
         self.tensor_tf = build_tensor_transform(img_size)
         self.aug = build_photometric_aug() if training else None
         self.flip_flags = flip_flags
@@ -359,12 +305,6 @@ class SurgicalInstrumentDataset(Dataset):
             "length": torch.tensor(length_norm, dtype=torch.float32),
             "label": torch.tensor(r["label"], dtype=torch.long),
         }
-        # SEF: compute Scharr edge map from the augmented/flipped image then resize to img_size
-        if self.use_sef:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            edge = scharr_edge_map(gray)  # (H,W) float [0,1]
-            edge_resized = cv2.resize(edge, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-            out["edge_map"] = torch.from_numpy(edge_resized).unsqueeze(0).float()  # (1,H,W)
         return out
 
 

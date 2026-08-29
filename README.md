@@ -2,7 +2,7 @@
 
 Fine-grained classification of **14 surgical instruments** on a **green cloth** — where several classes differ *only* by length. Small data (~400 images, ~30/class), fixed camera rig. The main difficulty is **shadows from lighting** that make bounding the instrument hard (more than background color).
 
-**Architecture:** `DINOv2-S/14 (ViT-S)` + `LoRA r=16` + `length fusion` + `ArcFace`
+**Architecture:** `DINOv2-S/14 (ViT-S)` + `LoRA r=16` + `length fusion` + `ArcFace` + `CAHM` (kept)
 
 ```
 image → DINOv2 → 384-d ─┐
@@ -15,7 +15,7 @@ mask  → length (px/cm) ─┘
 ```bash
 pip install -r requirements.txt
 
-# Train (default 504 from experiments)
+# Train (CAHM on by default, 504 from experiments)
 python train.py --data_dir dataset --epochs 50 --batch_size 32 --img_size 504
 
 # Evaluate
@@ -40,8 +40,8 @@ dataset/
 Open `DentalInstrument_DINOv2_ArcFace.ipynb` — self-contained (writes all modules via `%%writefile`)
 
 - Cell `3.5` checks `kNN probe` before training
-- Cell `4` trains (`504 batch32` on T4)
-- Cells `5.5 / 5.6` train and compare `ablation` 6 configs
+- Cell `4` trains (`504 batch32` on T4, CAHM on by default)
+- Cell `5` evaluates
 
 See `ALGORITHM.md` for full algorithm
 
@@ -56,6 +56,7 @@ cfg = TrainConfig(
     bbox_margin=0.15,  # from experiments
     lora_r=16,
     calibration_ratio=None,  # cm/px if you have a ruler reference
+    # use_cahm=True by default (from ablation)
 )
 ```
 
@@ -76,16 +77,19 @@ Edit `config.py` or override when creating `TrainConfig`
 
 `bbox_margin` at `504`: `0.0 → 0.3074` / `0.10 → 0.7377` / `0.15 → 0.7582` / `0.20 → 0.7336`
 
-**Training (LoRA r16, 50 epochs, early-stop)**
+**Training (LoRA r16, 50 epochs, early-stop, 504)**
 
-| Split | Val Acc | Balanced | Needle↔Artery |
-|---|---|---|---|
-| 1032/244 single (224) | 0.9467 | 0.9445 | 5+3=8 |
-| 1032/244 single (504) | 0.9426 | 0.9468 | 3+3=6 |
-| 1020/256 k-fold Fold1 (224) | 0.9688 | — | 8/256 errors |
+| Config | Val Acc | Balanced | Needle↔Artery | Note |
+|---|---|---|---|---|
+| baseline | 0.9467 | 0.9506 | 5+3=8 |  |
+| cahm | **0.9590** | **0.9606** | **2+1=3** | **kept — enabled by default** |
+| lgms | 0.9385 | 0.9348 | 3+6=9 | removed — worse than baseline |
+| sef | 0.9549 | 0.9461 | 5+2=7 | removed — not as good as cahm |
+| cahm_lgms | 0.9508 | 0.9510 | 3+3=6 | removed |
+| all | 0.9508 | 0.9567 | 2+3=5 | removed — not better than cahm alone |
 
-`504` gives the best `kNN` and reduces `Needle` errors from `8 → 6`, so it is set as default for training.
-See `ablation` (6 configs `CAHM/LGMS/SEF`) in `tools/evaluate_ablation.py` or notebook cells `5.6`.
+Only **CAHM** is kept (`use_cahm=True` by default). `LGMS`/`SEF` were tried and removed — see `ALGORITHM.md` and git history.
+Ablation was run on `1032/244` single split at `504` (same as `kNN` best). `LGMS`/`SEF` code and flags are deleted.
 
 ## License
 

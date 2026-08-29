@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dataset import build_tensor_transform, mask_from_coco_segmentation, measure_length_px, scharr_edge_map
+from dataset import build_tensor_transform, mask_from_coco_segmentation, measure_length_px
 from model import arcface_logits
 
 
@@ -34,7 +34,7 @@ def load_pipeline(ckpt_path: str, device: Optional[torch.device] = None) -> dict
     from evaluate import load_bundle
     pack = load_bundle(ckpt_path, device)
     pack["tensor_tf"] = build_tensor_transform(pack["cfg"].img_size)
-    # Store cfg as dict so predict_array can read use_tta/use_sef
+    # Store cfg as dict so predict_array can read use_tta
     if hasattr(pack["cfg"], "to_dict"):
         # Keep original object as well for img_size
         pack["_cfg_obj"] = pack["cfg"]
@@ -46,18 +46,7 @@ def _predict_once(pack: dict, image_rgb: np.ndarray, ln_norm: float) -> torch.Te
     """Single forward pass → returns logits tensor (num_classes,)"""
     tensor = pack["tensor_tf"](image=image_rgb)["image"][None].to(pack["device"])
     ln = torch.tensor([ln_norm], dtype=torch.float32, device=pack["device"])
-    edge = None
-    cfg = pack.get("cfg", {})
-    if cfg.get("use_sef", False):
-        # Scharr edge map from the image after crop/resize, same as used during training
-        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-        edge_np = scharr_edge_map(gray)
-        h, w = image_rgb.shape[:2]
-        # edge must be resized to match tensor (img_size)
-        img_size = cfg.get("img_size", 616)
-        edge_resized = cv2.resize(edge_np, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-        edge = torch.from_numpy(edge_resized).unsqueeze(0).unsqueeze(0).to(pack["device"]).float()
-    emb = pack["model"](tensor, ln, edge)
+    emb = pack["model"](tensor, ln)
     return arcface_logits(pack["arcface"], emb.float())[0]
 
 @torch.no_grad()

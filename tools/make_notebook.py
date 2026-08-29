@@ -9,7 +9,7 @@ import json
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODULES = ["config.py", "dataset.py", "edge_branch.py", "model.py", "train.py", "evaluate.py", "infer.py"]
+MODULES = ["config.py", "dataset.py", "model.py", "train.py", "evaluate.py", "infer.py"]
 OUT = os.path.join(ROOT, "DentalInstrument_DINOv2_ArcFace.ipynb")
 
 
@@ -207,9 +207,9 @@ metrics = evaluate_checkpoint(best_ckpt)
 print(f"\\nAccuracy: {metrics['accuracy']:.4f}")'''))
 
 # ---------------------------------------------------------------- ablation training (Phase 3)
-cells.append(md("""## 5.5) Phase 3 — Train 6 ablation variants (baseline vs CAHM/LGMS/SEF)
+cells.append(md("""## 5.5) Phase 3 — Ablation (baseline vs CAHM)
 
-Run each variant and keep its checkpoint — **do it this way on Colab** to compare results in the next cell.
+CAHM is kept (`use_cahm=True` by default, 0.9590 vs baseline 0.9467, Needle 8→3). Run both to reproduce the table in README.
 Each variant early-stops at ~20-35 epochs (patience 12) | 504 px batch 32 on T4 ~7-8 GB — if OOM, batch is automatically reduced to 16.
 """))
 cells.append(code('''from config import TrainConfig
@@ -217,12 +217,8 @@ from train import run_training
 import torch
 
 ablation = {
-    "baseline":  {},
+    "baseline":  {"use_cahm": False},
     "cahm":      {"use_cahm": True},
-    "lgms":      {"use_lgms": True},
-    "sef":       {"use_sef": True},
-    "cahm_lgms": {"use_cahm": True, "use_lgms": True},
-    "all":       {"use_cahm": True, "use_lgms": True, "use_sef": True},
 }
 
 ckpt_map = {}
@@ -250,11 +246,12 @@ for name, extra in ablation.items():
 
 print("\\n--- ckpt_map ---")
 for k,v in ckpt_map.items():
-    print(f'{k}: "{v}"')'''))
+    print(f'{k}: \"{v}\"')'''))
+
 
 cells.append(md("""## 5.6) Compare ablations — Phase 3 table
 
-Measure Val Acc / Balanced Acc / Needle_Holder↔Artery_Forceps error across all 6 variants
+Measure Val Acc / Balanced Acc / Needle_Holder↔Artery_Forceps error for baseline vs CAHM
 via `tools/evaluate_ablation.py` (runnable both in the notebook and as CLI)
 """))
 cells.append(code('''from tools.evaluate_ablation import compare_checkpoints
@@ -263,7 +260,6 @@ cells.append(code('''from tools.evaluate_ablation import compare_checkpoints
 # ckpt_map = {
 #     "baseline": "outputs_ablation/baseline/best_model.pt",
 #     "cahm": "outputs_ablation/cahm/best_model.pt",
-#     ...
 # }
 results = compare_checkpoints(ckpt_map, data_dir=DATA_DIR, save_csv="outputs_ablation/ablation_results.csv")
 print("\\n--- Summary ---")

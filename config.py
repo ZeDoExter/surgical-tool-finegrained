@@ -36,8 +36,6 @@ class TrainConfig:
     mixup_alpha: float = 0.4           # Mixup alpha for regularization (0.0 = off)
                                       # smaller = stronger, 0.4 suits ~30 samples/class
     use_tta: bool = True               # enable TTA at inference (flip + multi-scale)
-    # ---------------- SEF (Scharr Edge Fusion) ----------------
-    use_sef: bool = False                # enable Scharr edge branch (adds 64-dim edge feature)
 
     # ---------------- ArcFace ----------------
     margin: float = 28.6               # additive angular margin in degrees (≈ 0.5 rad)
@@ -45,15 +43,10 @@ class TrainConfig:
     scale: float = 64.0                # s: scale cosine before softmax so gradients don't vanish
 
     # ---------------- CAHM (Confusion-Aware Hard Mining) ----------------
-    use_cahm: bool = False
+    use_cahm: bool = True              # enabled by default — from ablation: 0.9590 vs baseline 0.9467, Needle 8→3
     cahm_alpha: float = 2.0            # extra weight for confused pairs
     cahm_beta: float = 0.9             # EMA smoothing for difficulty score
     cahm_start_epoch: int = 10         # start after this epoch (let confusion stabilize)
-
-    # ---------------- LGMS (Length-Gated Margin Scaling) ----------------
-    use_lgms: bool = False
-    lgms_gamma: float = 10.0           # max extra degrees for margin of length-similar classes
-    lgms_k: int = 2                    # number of nearest twin classes
 
     # ---------------- Training ----------------
     batch_size: int = 32               # fills T4 15GB at 504px with DINOv2-S + LoRA
