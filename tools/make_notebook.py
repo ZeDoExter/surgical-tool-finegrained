@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""tools/make_notebook.py — สร้าง Colab notebook (.ipynb) ที่ฝังโมดูลทั้งหมดผ่าน %%writefile
+"""tools/make_notebook.py — build Colab notebook (.ipynb) that embeds all modules via %%writefile
 
-รัน: python tools/make_notebook.py
-ผลลัพธ์: DentalInstrument_DINOv2_ArcFace.ipynb (อัปโหลดขึ้น Google Colab ได้เลย)
-การันตีว่าเนื้อหาใน notebook = ไฟล์ .py จริงใน repo (อ่านจากดิสก์ตอน generate)
+Run: python tools/make_notebook.py
+Output: DentalInstrument_DINOv2_ArcFace.ipynb (upload to Google Colab)
+Guaranteed that notebook content = actual .py files in the repo (read from disk at generate time)
 """
 import json
 import os
@@ -25,44 +25,44 @@ def code(text: str) -> dict:
 cells = []
 
 # ---------------------------------------------------------------- intro
-cells.append(md("""# 🦷 Fine-grained Classification เครื่องมือผ่าตัด — DINOv2 + Length Fusion + ArcFace
+cells.append(md("""# 🦷 Fine-grained Classification of Surgical Instruments — DINOv2 + Length Fusion + ArcFace
 
-Pipeline สำหรับจำแนก **เครื่องมือผ่าตัด 14 classes** (~400 ภาพ) โลหะสีเงินบนถาดสีเงิน บางคู่ class ต่างกันแค่ความยาว:
+Pipeline for classifying **14 surgical instrument classes** (~400 images) on a green cloth with shadows. Some classes differ only by length:
 
 ```
-ภาพ ──► DINOv2 ViT-S/14 ──► CLS embedding (384-dim)──┐
+image ──► DINOv2 ViT-S/14 ──► CLS embedding (384-dim)──┐
                                                       ├─ concat(385) ─► Linear ─► 384 ─► ArcFace loss
-mask ──► minAreaRect ──► ความยาว (normalize) ─────────┘
+mask ──► minAreaRect ──► length (normalized) ─────────┘
 ```
 
-**สิ่งที่ notebook นี้ทำ:** ติดตั้ง deps → เขียนโมดูลทั้ง 6 ไฟล์ (`config/dataset/model/train/evaluate/infer`) → sanity-check ข้อมูล → เทรน (LoRA + warmup/cosine + early stopping) → confusion matrix → inference demo
+**What this notebook does:** install deps → write all 6 modules (`config/dataset/model/train/evaluate/infer`) → sanity-check data → train (LoRA + warmup/cosine + early stopping) → confusion matrix → inference demo
 
-**ข้อมูลที่ต้องเตรียม:** Roboflow export แบบ *COCO Segmentation* ที่มีโครงสร้าง
+**Data to prepare:** Roboflow export as *COCO Segmentation* with structure
 `DATA_DIR/train/_annotations.coco.json` + `DATA_DIR/valid/_annotations.coco.json`
 """))
 
 # ---------------------------------------------------------------- install
-cells.append(md("## 0) ติดตั้ง dependencies"))
+cells.append(md("## 0) Install dependencies"))
 cells.append(code("%pip install -q -U torchao peft transformers pytorch-metric-learning albumentations "
                   "opencv-python-headless scikit-learn seaborn tqdm\nprint('✅ deps ready')"))
 
 # ---------------------------------------------------------------- data
-cells.append(md("""## 1) เตรียมข้อมูล — เลือก **วิธีใดวิธีหนึ่ง** แล้วรันเซลล์นี้"""))
-cells.append(code('''# ── กำหนด DATA_DIR ให้ตรงกับที่ข้อมูลอยู่ ──────────────────────────────
+cells.append(md("""## 1) Prepare data — pick **one method** and run this cell"""))
+cells.append(code('''# ── Set DATA_DIR to where your dataset lives ──────────────────────────────
 DATA_DIR = "/content/dental_dataset"
 
-# ▸ วิธี A: อัปโหลดไฟล์ .zip (export จาก Roboflow แล้ว zip ไว้)
+# ▸ Method A: Upload a .zip file (exported from Roboflow and zipped)
 # from google.colab import files
-# up = files.upload()                       # เลือก dataset.zip
+# up = files.upload()                       # select dataset.zip
 # !unzip -o -q "{list(up.keys())[0]}" -d /content/
-# DATA_DIR = "/content/dataset"             # ← แก้ตามชื่อโฟลเดอร์ข้างใน zip
+# DATA_DIR = "/content/dataset"             # ← adjust to the folder name inside the zip
 
-# ▸ วิธี B: ไฟล์อยู่บน Google Drive อยู่แล้ว
+# ▸ Method B: Dataset already on Google Drive
 # from google.colab import drive
 # drive.mount('/content/drive')
 # DATA_DIR = "/content/drive/MyDrive/path/to/dataset"
 
-# ▸ วิธี C: ดึงตรงจาก Roboflow (แก้ API_KEY / WORKSPACE / PROJECT / VERSION)
+# ▸ Method C: Pull directly from Roboflow (set API_KEY / WORKSPACE / PROJECT / VERSION)
 # %pip install -q roboflow
 # from roboflow import Roboflow
 # rf = Roboflow(api_key="YOUR_API_KEY")
@@ -71,18 +71,18 @@ DATA_DIR = "/content/dental_dataset"
 
 import pathlib
 assert pathlib.Path(DATA_DIR, "train", "_annotations.coco.json").exists(), \\
-    f"ไม่พบ {DATA_DIR}/train/_annotations.coco.json — รันเซลล์ import ข้อมูลก่อน"
+    f"not found {DATA_DIR}/train/_annotations.coco.json — run the data-import cell first"
 for sp in ["train", "valid", "test"]:
     p = pathlib.Path(DATA_DIR, sp)
     if p.exists():
         n_img = len(list(p.glob('*.jpg'))) + len(list(p.glob('*.png'))) + len(list(p.glob('*.jpeg')))
         n_json = len(list(p.glob('*annotations*.json')))
-        print(f"{sp:6s}: {n_img:4d} รูป, {n_json} annotation file")'''))
+        print(f"{sp:6s}: {n_img:4d} images, {n_json} annotation file(s)")'''))
 
 # ---------------------------------------------------------------- modules
-cells.append(md("""## 2) เขียนโมดูลโค้ดลงไฟล์ (%%writefile)
+cells.append(md("""## 2) Write module files (%%writefile)
 
-แต่ละเซลล์สร้างไฟล์ .py ตามหน้าที่ — แก้โค้ดได้จากไฟล์ editor ด้านซ้ายของ Colab หลังจากรันแล้ว"""))
+Each cell creates a .py file by role — you can edit the code from the file editor on the left side of Colab after running"""))
 
 for mod in MODULES:
     with open(os.path.join(ROOT, mod), encoding="utf-8") as f:
@@ -90,10 +90,10 @@ for mod in MODULES:
     cells.append(code(f"%%writefile {mod}\n{src}" if not src.endswith("\n") else f"%%writefile {mod}\n{src}"))
 
 # ---------------------------------------------------------------- sanity check
-cells.append(md("""## 3) Sanity check ข้อมูล
+cells.append(md("""## 3) Data sanity check
 
-เช็ค: จำนวนภาพต่อ class, mask overlay ถูกไหม, ความยาวที่วัดได้ sensible ไหม — **ก่อนเทรนเสมอ**"""))
-cells.append(code('''CALIB_RATIO = None   # ← cm/pixel ถ้ามี object อ้างอิง (เช่น 0.05) ; None = ใช้ pixel
+Check: images per class, mask overlay correctness, whether measured lengths look sensible — **always before training**"""))
+cells.append(code('''CALIB_RATIO = None   # ← cm/pixel if you have a reference object (e.g. 0.05); None = use pixels
 
 import sys; sys.path.insert(0, "/content")
 from collections import Counter
@@ -102,9 +102,9 @@ from dataset import load_coco_records, visualize_records, compute_length_stats
 
 train_recs, class_names = load_coco_records(DATA_DIR, "train")
 dist = Counter(r["class_name"] for r in train_recs)
-print(f"class ทั้งหมด: {len(class_names)}")
+print(f"Total classes: {len(class_names)}")
 for n in class_names:
-    print(f"  {n:30s}: {dist[n]} ภาพ")
+    print(f"  {n:30s}: {dist[n]} images")
 
 stats = compute_length_stats(train_recs, CALIB_RATIO)
 unit = "cm" if CALIB_RATIO else "px"
@@ -112,12 +112,12 @@ print(f"\\nlength stats (train): mean={stats[0]:.1f} {unit}, std={stats[1]:.1f}"
 
 fig = visualize_records(train_recs, calibration_ratio=CALIB_RATIO, n=6, seed=7)'''))
 
-cells.append(md("""## 3.5) เช็คว่า weight ของ DINOv2 พร้อมหรือยัง (frozen kNN probe — ไม่ต้องเทรน)
+cells.append(md("""## 3.5) Check whether DINOv2 weights are ready (frozen kNN probe — no training needed)
 
-ใช้ DINOv2 **frozen** ดึง feature → ทำนายด้วย 1-nearest-neighbor:
-- accuracy สูงกว่า random (1/14 ≈ 7%) **มากๆ** (เช่น >40-50%) = feature แยก class ได้อยู่แล้ว เทรนต่อคุ้ม
-- accuracy ต่ำเฉียด random = domain gap แรงเกิน → ลอง `img_size=518` (คมขึ้น) หรือ backbone ใหญ่ขึ้น"""))
-cells.append(code('''# ponytail: probe ไม่เทรนสัก step — เช็คคุณภาพ feature ก่อนลงทุนเทรนจริง
+Use frozen DINOv2 to extract features → predict with 1-nearest-neighbor:
+- Accuracy far above random (1/14 ≈ 7%) (e.g. >40-50%) = features already separate classes well, worth training further
+- Accuracy near random = domain gap too large → try `img_size=518` (sharper) or a larger backbone"""))
+cells.append(code('''# ponytail: probe trains for zero steps — check feature quality before investing in full training
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -143,65 +143,65 @@ def embed(recs, training):
     E, Y = [], []
     for b in DataLoader(ds, batch_size=32, num_workers=2):
         out = probe_model.backbone(pixel_values=b["image"].to(device)).last_hidden_state
-        E.append(out[:, 0].cpu())          # CLS ดิบ — ไม่ผ่าน fusion head (head ยังสุ่มอยู่)
+        E.append(out[:, 0].cpu())          # raw CLS — not through the fusion head (head is still randomly initialized)
         Y.append(b["label"])
     return torch.cat(E), torch.cat(Y)
 
-Etr, ytr = embed(tr_recs, True)            # train-side aug เปิดได้ = ฟรี data augmentation ของ probe
+Etr, ytr = embed(tr_recs, True)            # training-side augmentation enabled = free data augmentation for the probe
 Eva, yva = embed(va_recs, False)
 sim = F.normalize(Eva, dim=1) @ F.normalize(Etr, dim=1).T
 pred = ytr[sim.argmax(dim=1)]
 acc = (pred == yva).float().mean().item()
 print(f"kNN probe accuracy: {acc:.3f}   (random = {1 / len(probe_classes):.3f})")
 if acc < 0.30:
-    print("⚠️ feature แยก class ค่อนข้างไม่ได้ — ลอง img_size=518 หรือ dinov2-base ก่อนเทรนจริง")
+    print("⚠️ features barely separate classes — try img_size=518 or dinov2-base before full training")
 else:
-    print("✅ feature ใช้ได้ — ไปเทรนต่อได้")'''))
+    print("✅ features look good — ready to train")'''))
 
 # ---------------------------------------------------------------- train
-cells.append(md("""## 4) เทรน
+cells.append(md("""## 4) Train
 
-- `finetune_mode="lora"` → เทรนเฉพาะ LoRA adapter (~พารามิเตอร์น้อยมาก) กัน overfitting
-- early stopping จาก validation loss, checkpoint ที่ดีที่สุดถูกเซฟอัตโนมัติ
-- อยากได้ผลประเมินแบบ cross-validation → ตั้ง `kfold=5`"""))
+- `finetune_mode="lora"` → train only LoRA adapters (very few parameters) to prevent overfitting
+- Early stopping on validation loss; the best checkpoint is saved automatically
+- For cross-validation evaluation → set `kfold=5`"""))
 cells.append(code('''from config import TrainConfig
 from train import run_training, run_kfold
 
 cfg = TrainConfig(
     data_dir=DATA_DIR,
-    img_size=504,            # 504=36×14 — จากการทดลองให้ผลดี
+    img_size=504,            # 504=36×14 — from experiments (divisible by 14, best size in our tests)
     batch_size=32,
-    finetune_mode="lora",     # "lora" (แนะนำ) | "partial" | "frozen"
+    finetune_mode="lora",     # "lora" (recommended) | "partial" | "frozen"
     epochs=50,
     num_workers=2,
-    # ---- ตัวเลือกเสริม ----
+    # ---- optional extras ----
     # calibration_ratio=CALIB_RATIO,
-    # flip_allowed=["class_a", "class_b"],  # เฉพาะ class ที่ flip ได้ (ที่เหลือห้าม flip)
+    # flip_allowed=["class_a", "class_b"],  # only classes that may be flipped (others are not flipped)
     # kfold=5,                              # Stratified 5-fold CV
 )
 
 if cfg.kfold:
     paths, accs = run_kfold(cfg)
-    best_ckpt = paths[accs.index(max(accs))]   # เลือก fold ที่ดีที่สุด
+    best_ckpt = paths[accs.index(max(accs))]   # pick the best fold
 else:
     best_ckpt = run_training(cfg)
 
-print("\\ncheckpoint ที่ดีที่สุด:", best_ckpt)'''))
+print("\\nBest checkpoint:", best_ckpt)'''))
 
 # ---------------------------------------------------------------- evaluate
-cells.append(md("""## 5) ประเมินผล — accuracy + confusion matrix
+cells.append(md("""## 5) Evaluate — accuracy + confusion matrix
 
-ดู heatmap ช่อง off-diagonal สีสว่าง = คู่ class ที่โมเดลสับสน (มักเป็นคู่ต่างกันแค่ขนาด)"""))
+Bright off-diagonal cells in the heatmap = class pairs the model confuses (often pairs that differ only in size)"""))
 cells.append(code('''from evaluate import evaluate_checkpoint
 
 metrics = evaluate_checkpoint(best_ckpt)
 print(f"\\nAccuracy: {metrics['accuracy']:.4f}")'''))
 
 # ---------------------------------------------------------------- ablation training (Phase 3)
-cells.append(md("""## 5.5) Phase 3 — เทรน ablation 6 สูตร (baseline vs CAHM/LGMS/SEF)
+cells.append(md("""## 5.5) Phase 3 — Train 6 ablation variants (baseline vs CAHM/LGMS/SEF)
 
-รันทีละสูตรแล้วเก็บ checkpoint — **ทำบน Colab แบบนี้** เพื่อวัดผลเปรียบเทียบในเซลล์ถัดไป
-แต่ละสูตร early-stop ที่ ~20-35 epoch (patience 12) | 504px batch32 บน T4 ~7-8GB — ถ้า OOM จะลด batch เหลือ 16 อัตโนมัติ
+Run each variant and keep its checkpoint — **do it this way on Colab** to compare results in the next cell.
+Each variant early-stops at ~20-35 epochs (patience 12) | 504 px batch 32 on T4 ~7-8 GB — if OOM, batch is automatically reduced to 16.
 """))
 cells.append(code('''from config import TrainConfig
 from train import run_training
@@ -230,7 +230,7 @@ for name, extra in ablation.items():
         ckpt = run_training(cfg_ab)
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
-            print("[OOM] ลด batch 32 → 16 แล้วลองใหม่")
+            print("[OOM] Reducing batch 32 → 16 and retrying")
             torch.cuda.empty_cache()
             cfg_ab.batch_size = 16
             ckpt = run_training(cfg_ab)
@@ -241,34 +241,34 @@ for name, extra in ablation.items():
 
 print("\\n--- ckpt_map ---")
 for k,v in ckpt_map.items():
-    print(f'{k}: \"{v}\"')'''))
+    print(f'{k}: "{v}"')'''))
 
-cells.append(md("""## 5.6) เปรียบเทียบ ablation — ตาราง Phase 3
+cells.append(md("""## 5.6) Compare ablations — Phase 3 table
 
-วัด Val Acc / Balanced Acc / Needle_Holder↔Artery_Forceps error พร้อมกัน 6 สูตร
-ผ่านไฟล์ `tools/evaluate_ablation.py` (รันได้ทั้งใน notebook และ CLI)
+Measure Val Acc / Balanced Acc / Needle_Holder↔Artery_Forceps error across all 6 variants
+via `tools/evaluate_ablation.py` (runnable both in the notebook and as CLI)
 """))
 cells.append(code('''from tools.evaluate_ablation import compare_checkpoints
 
-# ใช้ ckpt_map จากเซลล์ก่อนหน้า ถ้ายังไม่ได้รัน ablation ให้ใส่ path เองได้:
+# Use ckpt_map from the previous cell; if you haven't run ablations, set paths manually:
 # ckpt_map = {
 #     "baseline": "outputs_ablation/baseline/best_model.pt",
 #     "cahm": "outputs_ablation/cahm/best_model.pt",
 #     ...
 # }
 results = compare_checkpoints(ckpt_map, data_dir=DATA_DIR, save_csv="outputs_ablation/ablation_results.csv")
-print("\\n--- สรุป --")
+print("\\n--- Summary ---")
 for r in results:
     if r.get("found"):
         print(f'{r["name"]:12s} acc={r["accuracy"]:.4f} bal={r["balanced_acc"]:.4f} {r["needle_detail"]}')'''))
 
 # ---------------------------------------------------------------- inference
-cells.append(md("""## 6) Inference ทดลอง — ภาพใหม่ + mask → class + confidence"""))
+cells.append(md("""## 6) Inference demo — new image + mask → class + confidence"""))
 cells.append(code('''from infer import load_pipeline, predict_record
 from train import resolve_records
 
 pack = load_pipeline(best_ckpt)
-_, valid_recs, _ = resolve_records(cfg)   # เอาภาพ val มาลอง 3 ตัว
+_, valid_recs, _ = resolve_records(cfg)   # try 3 validation images
 
 for r in valid_recs[:3]:
     res = predict_record(pack, r)
@@ -278,32 +278,32 @@ for r in valid_recs[:3]:
     print("      top3:", tops)'''))
 
 # ---------------------------------------------------------------- save
-cells.append(md("""## 7) บันทึกโมเดลกลับ Drive / ดาวน์โหลด"""))
-cells.append(code('''# ▸ ดาวน์โหลดกลับเครื่อง
+cells.append(md("""## 7) Save model back to Drive / Download"""))
+cells.append(code('''# ▸ Download to local machine
 from google.colab import files
 files.download(best_ckpt)
 
-# ▸ หรือคัดลอกไป Drive (mount ก่อนถ้ายังไม่ได้ mount)
+# ▸ Or copy to Drive (mount first if not already mounted)
 # !cp "{best_ckpt}" /content/drive/MyDrive/'''))
 cells.append(md("""---
 ### 💡 Tips
-- **calibration_ratio**: วาง object ที่รู้ความยาวจริง L (cm) ใต้กล้อง rig เดิม → `ratio = L / measure_length_px(mask)` — feature ความยาวจะมีหน่วย cm ตีความง่าย
-- **handedness**: class ของซ้าย/ขวามือ → ใส่เฉพาะชื่อ class ที่ flip ได้ใน `flip_allowed`
+- **calibration_ratio**: place an object of known real length L (cm) under the same camera rig → `ratio = L / measure_length_px(mask)` — the length feature will be in cm and easier to interpret
+- **handedness**: for left/right-handed classes → list only the classes that may be flipped in `flip_allowed`
 
-### 🎯 Playbook คู่ class ที่แทบแยกไม่ออก (เช่น Universal forceps 150 vs 151, Root elevator งอ vs Root-tip elevator ตรง)
-1. **เพิ่ม resolution ก่อนเป็นอย่างแรก** — head ของ forceps ที่ 224px เหลือ ~20px ตั้ง `img_size=518` (=37×14, DINOv2 รับได้) patch token จะพกรายละเอียด "หัว" เยอะขึ้น ~2.3×; GPU ไม่พอลด batch เป็น 8
-2. **คู่ต่างความยาว** (elevator งอสั้น vs straight ยาว) — length feature จัดการอยู่แล้ว แต่ mask ต้องครอบปลายจริง (mask โดนเงา = ความยาวเพี้ยน = ฟีเจอร์เพี้ยน)
-3. **ถ่ายข้อมูลเพิ่มแบบเจาะจง**: ดู confusion matrix ในขั้น 5 → ถ่ายเพิ่มเฉพาะคู่ที่สับสน โดยหมุนมุม yaw ทีละ ~30° (บางมุมหัวซ่อน = ต้องมีภาพมุมที่เห็นจุดต่าง)
-4. **ยังสับสนหนัก?** แผน B: สองขั้น — แยกกลุ่มหยาบ (forceps/elevator/probe…) ก่อน แล้ว classifier เฉพาะคู่บน crop บริเวณหัว
+### 🎯 Playbook for near-indistinguishable class pairs (e.g. Universal forceps 150 vs 151, Curved Root elevator vs Straight Root-tip elevator)
+1. **Increase resolution first** — the head of forceps at 224 px is only ~20 px; set `img_size=518` (=37×14, accepted by DINOv2) and patch tokens will carry ~2.3× more "head" detail; if GPU memory is tight, reduce batch to 8
+2. **Pairs that differ in length** (short curved elevator vs long straight) — the length feature already handles this, but the mask must cover the true tip (shadow included in mask = length error = feature error)
+3. **Collect targeted extra data**: check the confusion matrix in step 5 → add more shots only for the confused pairs, rotating yaw by ~30° each time (some angles hide the head = you need angles that reveal the distinguishing point)
+4. **Still heavily confused?** Plan B: two-stage — first separate coarse groups (forceps/elevator/probe…) then a pair-specific classifier on a crop around the head
 
-### 📋 เช็คลิสต์ตอน annotate รอบใหม่ (Roboflow COCO Segmentation)
-- polygon ครอบ **ทั้งชิ้น** รวมหัว-ปลาย แต่ **ไม่เอาเงา** (เงาทำ minAreaRect ยืวขึ้น)
-- 1 annotation ต่อ 1 ชิ้นเครื่องมือ (1 ภาพหลายชิ้นได้ — pipeline crop รายชิ้นด้วย bbox_margin)
-- ชื่อ class ตั้งแล้วอย่าเปลี่ยนทีหลัง (label = ลำดับการ sort ชื่อ)
-- จำนวนต่อ class ห้ามหลุด ~25+ ภาพ และกระจายมุมถ่ายให้ทั่ว
-- พื้นเขียว: pipeline มี shadow augmentation ให้แล้ว แต่ถ่ายให้แสงสม่ำเสมอที่ทำได้ยังดีที่สุด
+### 📋 Checklist for the next annotation round (Roboflow COCO Segmentation)
+- Polygon must cover **the whole instrument** including head and tip, but **exclude shadows** (shadows stretch minAreaRect)
+- 1 annotation per instrument (multiple per image allowed — pipeline crops per instance via bbox_margin=0.15 from experiments)
+- Do not rename classes after they are set (label = sorted name order)
+- Keep ~25+ images per class and spread shooting angles evenly
+- Green cloth: pipeline already has shadow augmentation, but shooting with even lighting is still best
 
-- GPU: Runtime → Change runtime type → T4 GPU (CPU ได้แต่ช้า); `img_size=518` + T4 + batch 8 ≈ ไหว
+- GPU: Runtime → Change runtime type → T4 GPU (CPU works but is slow); `img_size=518` + T4 + batch 8 ≈ fits
 """))
 
 nb = {

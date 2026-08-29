@@ -1,16 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-dataset.py — โหลดภาพ + segmentation mask จาก COCO format (Roboflow export)
+dataset.py — Load images + segmentation masks from COCO format (Roboflow export)
 
-หน้าที่หลัก:
+Main responsibilities:
 1) parse ``_annotations.coco.json`` → records (path, polygon, label)
 2) rasterize polygon → binary mask
-3) วัดความยาวเครื่องมือจาก mask (minAreaRect) เป็น auxiliary feature 1 ค่า
-4) augmentation ที่ปลอดภัยกับงานนี้:
-   - เน้น photometric (brightness/contrast/gamma/CLAHE) จำลองแสงสะท้อนบนโลหะ
-   - ไม่มี crop/zoom ที่ทำลาย aspect ratio หรือ scale ของวัตถุ (ขนาดคือฟีเจอร์สำคัญ!)
-   - ไม่มี cutout/random erasing กลางวัตถุ
-   - horizontal flip เปิด/ปิดได้ "ต่อ class" (บาง class มี handedness ห้าม flip)
+3) measure instrument length from mask (minAreaRect) as a single auxiliary feature
+4) task-safe augmentation:
+   - focus on photometric ops (brightness/contrast/gamma/CLAHE) to simulate
+     specular reflections on metal and varying illumination on the green cloth
+   - no crop/zoom that would destroy aspect ratio or absolute scale
+     (size is a key discriminative feature!)
+   - no cutout / random erasing over the instrument
+   - horizontal flip can be toggled per class (some classes have handedness
+     and must not be flipped)
+
+Notes:
+- Background is green surgical cloth; shadows cast on the cloth move with
+  instrument placement / light direction and make bounding/segmentation harder
+  (harder than a high-contrast silver tray). Photometric + shadow simulation
+  targets this difficulty.
+- Experimental defaults found useful elsewhere in the project: image size 504
+  and bbox margin ~0.15. Defaults in this module are kept for compatibility;
+  see Dataset docstring.
 """
 import json
 import math
@@ -30,16 +42,17 @@ IMAGENET_MEAN: Tuple[float, ...] = (0.485, 0.456, 0.406)
 IMAGENET_STD: Tuple[float, ...] = (0.229, 0.224, 0.225)
 
 
-# ============================================================ การวัดความยาวจาก mask
+# ============================================================ Length measurement from mask
 def measure_length_px(mask: np.ndarray) -> float:
     """
-    คืนความยาวสูงสุดของเครื่องมือ หน่วย pixel (จาก binary mask ชิ้นเดียว)
+    Return the maximum length of the instrument in pixels (from a single binary mask).
 
-    ใช้ ``cv2.minAreaRect`` เพราะเครื่องมือมักวาง "เฉียง" ไม่ตรงแนวแกน —
-    กล่องหมุนที่มี area เล็กสุดที่ล้อม contour จะให้ด้านยาวสุด ≈ ความยาวจริงของเครื่องมือ
+    Uses ``cv2.minAreaRect`` because instruments are often placed diagonally
+    rather than axis-aligned — the minimum-area rotated rectangle enclosing the
+    contour gives a long side that approximates the true instrument length.
     """
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:  # mask ว่าง (annotation ผิดพลาด) → คืน 0 กัน crash
+    if not contours:  # empty mask (annotation error) → return 0 to avoid crash
         return 0.0
     largest = max(contours, key=cv2.contourArea)
     rect = cv2.minAreaRect(largest)  # ((cx,cy), (w,h), angle)
@@ -48,15 +61,15 @@ def measure_length_px(mask: np.ndarray) -> float:
 
 
 def get_length_cm(mask: np.ndarray, calibration_ratio: float) -> float:
-    """แปลงความยาว pixel → cm ด้วย calibration_ratio (cm/pixel) จาก object อ้างอิง"""
+    """Convert pixel length → cm using calibration_ratio (cm/pixel) from a reference object."""
     return measure_length_px(mask) * calibration_ratio
 
 
 def mask_from_coco_segmentation(segmentation, height: int, width: int) -> np.ndarray:
     """
-    แปลง segmentation ของ COCO → binary mask (uint8, ค่า 0/255)
+    Convert COCO segmentation → binary mask (uint8, values 0/255).
 
-    รองรับ polygon (รูปแบบมาตรฐานของ Roboflow) และ RLE (ต้องมี pycocotools)
+    Supports polygon (standard Roboflow format) and RLE (requires pycocotools).
     """
     mask = np.zeros((height, width), dtype=np.uint8)
     if isinstance(segmentation, dict):  # RLE format
@@ -64,13 +77,13 @@ def mask_from_coco_segmentation(segmentation, height: int, width: int) -> np.nda
             from pycocotools import mask as mask_utils
         except ImportError as exc:
             raise ImportError(
-                "เจอ segmentation แบบ RLE แต่ยังไม่ได้ติดตั้ง pycocotools (pip install pycocotools)"
+                "Found RLE segmentation but pycocotools is not installed (pip install pycocotools)"
             ) from exc
         rle = segmentation
-        if isinstance(rle.get("counts"), list):  # uncompressed RLE → แปลงเป็น compressed ก่อน
+        if isinstance(rle.get("counts"), list):  # uncompressed RLE → convert to compressed first
             rle = mask_utils.frPyObjects(rle, height, width)
         return (mask_utils.decode(rle) * 255).astype(np.uint8)
-    for poly in segmentation:  # list ของ polygon [[x1,y1,x2,y2,...], ...]
+    for poly in segmentation:  # list of polygons [[x1,y1,x2,y2,...], ...]
         pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
         cv2.fillPoly(mask, [np.round(pts).astype(np.int32)], 255)
     return mask
@@ -79,19 +92,21 @@ def mask_from_coco_segmentation(segmentation, height: int, width: int) -> np.nda
 # ============================================================ COCO parsing
 def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]:
     """
-    อ่านโฟลเดอร์ split ("train"/"valid"/"test") ที่มี ``_annotations.coco.json``
+    Read a split folder ("train"/"valid"/"test") containing ``_annotations.coco.json``.
 
-    คืน ``(records, class_names)`` โดย record = dict ที่มี
-    ``image_path / segmentation / width / height / class_name / label``
+    Returns ``(records, class_names)`` where each record is a dict with
+    ``image_path / segmentation / width / height / class_name / label``.
 
-    - label = index จากการ **sort ชื่อ class** (คงที่เสมอ ไม่ว่า category_id ใน json จะเรียงแบบไหน)
-    - 1 annotation = 1 sample → ถ้า 1 ภาพมีหลายเครื่องมือ จะได้หลาย sample
-      (แนะนำใช้ bbox_margin > 0 ใน Dataset เพื่อ crop รายชิ้น)
+    - label = index from **sorted class names** (stable regardless of
+      category_id ordering in the json).
+    - 1 annotation = 1 sample → if one image contains multiple instruments
+      it yields multiple samples (recommend using bbox_margin > 0 in
+      Dataset to crop per instance).
     """
     split_dir = os.path.join(data_dir, split)
     ann_path = os.path.join(split_dir, "_annotations.coco.json")
     if not os.path.exists(ann_path):
-        raise FileNotFoundError(f"ไม่เจอไฟล์ annotation: {ann_path}")
+        raise FileNotFoundError(f"Annotation file not found: {ann_path}")
     with open(ann_path, "r", encoding="utf-8") as f:
         coco = json.load(f)
 
@@ -118,14 +133,14 @@ def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]
 
 
 def segmentation_bbox(segmentation, width: int, height: int) -> Tuple[int, int, int, int]:
-    """bounding box (x1,y1,x2,y2) ครอบ polygon ทั้งหมด — ใช้ตอน crop รายชิ้น (bbox_margin > 0)"""
+    """Bounding box (x1,y1,x2,y2) enclosing all polygons — used when cropping per instance (bbox_margin > 0)."""
     xs: List[float] = []
     ys: List[float] = []
     for poly in segmentation if isinstance(segmentation, list) else []:
         pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
         xs += [float(pts[:, 0].min()), float(pts[:, 0].max())]
         ys += [float(pts[:, 1].min()), float(pts[:, 1].max())]
-    if not xs:  # RLE หรือ polygon ว่าง → ใช้ทั้งภาพ
+    if not xs:  # RLE or empty polygon → use full image
         return 0, 0, width, height
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
@@ -133,21 +148,24 @@ def segmentation_bbox(segmentation, width: int, height: int) -> Tuple[int, int, 
 # ============================================================ Augmentation
 def build_photometric_aug() -> A.Compose:
     """
-    Augmentation ฝั่ง "แสง" สำหรับ train — ตั้งใจให้แรงกว่าปกติ เพราะโลหะสะท้อนแสง
-    ต่างกันทุกครั้งที่ถ่าย แต่ *ไม่มี* การ crop/scale/cutout ใดๆ เพราะ
-    "ขนาดและรูปทรง" คือสิ่งที่โมเดลต้องเรียนรู้เพื่อแยก class ที่เหมือนกัน
+    Photometric augmentation for training — intentionally stronger than usual
+    because metal reflections vary per capture, and the green cloth background
+    with shifting shadows makes illumination inconsistent.
+
+    Critically, there is *no* crop/scale/cutout because "size and shape"
+    are what the model must learn to separate visually similar classes.
     """
     return A.Compose([
-        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),             # เพิ่ม local contrast (โลหะบนถาดโลหะ contrast ต่ำ)
-        A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.7),  # jitter แรงกว่าปกติ
-        A.RandomGamma(gamma_limit=(70, 150), p=0.7),                        # จำลอง exposure/แสงไฟต่างกัน
+        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),             # boost local contrast (metal on green cloth has low contrast; shadows worsen it)
+        A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.7),  # stronger-than-usual jitter
+        A.RandomGamma(gamma_limit=(70, 150), p=0.7),                        # simulate different exposure / lighting
         A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=15, p=0.3),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.2),                           # เบลอเล็กน้อยแบบ defocus
+        A.GaussianBlur(blur_limit=(3, 7), p=0.2),                           # slight defocus blur
     ])
 
 
 def build_tensor_transform(img_size: int) -> A.Compose:
-    """resize ขนาดคงที่ + normalize ด้วยค่า ImageNet + แปลงเป็น tensor (ใช้ทั้ง train/eval/infer)"""
+    """Fixed-size resize + ImageNet normalization + conversion to tensor (used for train/eval/infer)."""
     return A.Compose([
         A.Resize(img_size, img_size),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -157,8 +175,8 @@ def build_tensor_transform(img_size: int) -> A.Compose:
 
 def scharr_edge_map(gray: np.ndarray) -> np.ndarray:
     """
-    คำนวณ Scharr edge magnitude จากภาพ grayscale (uint8) — คืน float32 [0,1]
-    ใช้สำหรับ SEF branch: เน้นขอบ/รูปทรงของเครื่องมือให้ชัดกว่าสี
+    Compute Scharr edge magnitude from a grayscale image (uint8) — returns float32 in [0, 1].
+    Used for the SEF branch: emphasizes edges/shape of the instrument over color.
     """
     gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
@@ -170,7 +188,7 @@ def scharr_edge_map(gray: np.ndarray) -> np.ndarray:
 
 
 def compute_class_length_means(records: List[dict], calibration_ratio: Optional[float] = None) -> dict:
-    """เฉลี่ยความยาวต่อ class (สำหรับ LGMS) — ใช้ train records เท่านั้น"""
+    """Mean length per class (for LGMS) — use training records only."""
     from collections import defaultdict
     sums: dict = defaultdict(list)
     for r in records:
@@ -185,9 +203,9 @@ def compute_class_length_means(records: List[dict], calibration_ratio: Optional[
 def compute_lgms_margins(class_means: dict, num_classes: int, m_base: float = 28.6,
                          gamma: float = 10.0, k: int = 2) -> List[float]:
     """
-    คำนวณ margin ต่อ class สำหรับ LGMS
+    Compute per-class margin for LGMS.
     sim_len(i,j) = 1 - |len_i - len_j| / max_diff
-    m(y) = m_base + gamma * mean(sim ของ k คู่ใกล้สุด)
+    m(y) = m_base + gamma * mean(sim of k nearest neighbors)
     """
     means = np.array([class_means.get(i, 0.0) for i in range(num_classes)], dtype=np.float64)
     if num_classes <= 1:
@@ -196,13 +214,13 @@ def compute_lgms_margins(class_means: dict, num_classes: int, m_base: float = 28
     max_diff = float(diff.max())
     if max_diff < 1e-6:
         return [m_base] * num_classes
-    sim = 1.0 - diff / max_diff  # 0..1, สูง = ใกล้กัน
-    np.fill_diagonal(sim, -1)  # ไม่นับตัวเอง
+    sim = 1.0 - diff / max_diff  # 0..1, higher = more similar length
+    np.fill_diagonal(sim, -1)  # exclude self
     margins = []
     for y in range(num_classes):
-        # k อันดับสูงสุด
+        # top-k most similar
         topk_idx = np.argsort(sim[y])[::-1][:k]
-        # กรองค่าลบ (กรณี k > C-1)
+        # filter negative values (when k > C-1)
         vals = [sim[y, j] for j in topk_idx if sim[y, j] >= 0]
         mean_sim = float(np.mean(vals)) if vals else 0.0
         margins.append(float(m_base + gamma * mean_sim))
@@ -210,11 +228,16 @@ def compute_lgms_margins(class_means: dict, num_classes: int, m_base: float = 28
 
 def simulate_shadow(img: np.ndarray, rng: Optional[random.Random] = None) -> np.ndarray:
     """
-    จำลอง "เงา" บนพื้นหลังสีเขียว (green mat) — เงาเคลื่อนตามตำแหน่งวางเครื่องมือ/ทิศไฟ
+    Simulate "shadow" on the green cloth background — shadows shift with
+    instrument placement / light direction.
 
-    วาด blob มืดขอบนุ่ม 1-2 จุด (ellipse + Gaussian falloff) คูณลงภาพ
-    เขียน numpy เองแทน A.RandomShadow เพราะ signature ของ albumentations
-    เปลี่ยนบ่อยระหว่าง 1.x ↔ 2.x — ไม่อยากผูกกับเวอร์ชัน
+    Draws 1-2 soft-edged dark blobs (ellipse + Gaussian falloff) multiplied
+    onto the image. Implemented in numpy instead of A.RandomShadow because
+    albumentations' signature changes frequently between 1.x ↔ 2.x — avoids
+    version coupling.
+
+    Green cloth shadows are the main difficulty for bounding/segmentation
+    (not reflections on a silver tray).
     """
     rng = rng or random
     h, w = img.shape[:2]
@@ -224,16 +247,16 @@ def simulate_shadow(img: np.ndarray, rng: Optional[random.Random] = None) -> np.
         cx, cy = rng.uniform(0, w), rng.uniform(0, h)
         ax = rng.uniform(w * 0.2, w * 0.7)
         ay = rng.uniform(h * 0.2, h * 0.7)
-        strength = rng.uniform(0.35, 0.65)          # เงาดำสุด ~35-65%
+        strength = rng.uniform(0.35, 0.65)          # darkest shadow ~35-65%
         d2 = ((xx - cx) / ax) ** 2 + ((yy - cy) / ay) ** 2
         mask *= 1.0 - strength * np.exp(-d2)
     out = img.astype(np.float32) * mask[..., None]
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ============================================================ สถิติความยาว + split
+# ============================================================ Length statistics + split
 def record_lengths(records: List[dict], calibration_ratio: Optional[float]) -> List[float]:
-    """วัดความยาวของทุก record (px หรือ cm ถ้ามี ratio) — rasterize จาก polygon โดยตรง"""
+    """Measure length of every record (px or cm if ratio given) — rasterize directly from polygon."""
     out = []
     for r in records:
         mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
@@ -244,8 +267,8 @@ def record_lengths(records: List[dict], calibration_ratio: Optional[float]) -> L
 
 def compute_length_stats(records: List[dict], calibration_ratio: Optional[float] = None) -> Tuple[float, float]:
     """
-    คำนวณ mean/std ของความยาว — **ต้องคำนวณจาก train เท่านั้น**
-    แล้วใช้ค่าเดียวกันนี้ normalize ทั้ง val/test/inference (กัน data leakage)
+    Compute mean/std of lengths — **must be computed from train only**
+    and the same values reused to normalize val/test/inference (avoid data leakage).
     """
     L = np.asarray(record_lengths(records, calibration_ratio), dtype=np.float64)
     mean = float(L.mean())
@@ -254,7 +277,7 @@ def compute_length_stats(records: List[dict], calibration_ratio: Optional[float]
 
 
 def stratified_split(records: List[dict], val_fraction: float = 0.2, seed: int = 42):
-    """แบ่ง train/val แบบ stratified (คงสัดส่วน class) — จำเป็นเมื่อข้อมูลน้อย ~30 ภาพ/class"""
+    """Stratified train/val split (preserve class proportions) — needed when data is scarce (~30 images/class)."""
     if val_fraction <= 0 or len(records) < 10:
         return records, []
     from sklearn.model_selection import train_test_split
@@ -266,16 +289,22 @@ def stratified_split(records: List[dict], val_fraction: float = 0.2, seed: int =
 # ============================================================ PyTorch Dataset
 class SurgicalInstrumentDataset(Dataset):
     """
-    Dataset สำหรับงานจำแนกเครื่องมือผ่าตัด — คืน dict:
-      ``image``  : FloatTensor (3, H, W) normalize แล้ว
-      ``length`` : scalar float = (ความยาว − mean) / std  ← auxiliary feature
+    Dataset for surgical instrument classification — returns a dict:
+      ``image``  : FloatTensor (3, H, W) normalized
+      ``length`` : scalar float = (length − mean) / std  ← auxiliary feature
       ``label``  : int64 class index
 
-    หมายเหตุสำคัญ:
-    - ความยาววัดจาก mask "ต้นฉบับ" (ก่อน augment) เพราะ photometric/flip ไม่ควรเปลี่ยนความยาวจริง
-    - ``flip_flags[label]`` เป็น True เท่านั้นที่จะโดน horizontal flip
-    - ``bbox_margin`` > 0 เมื่อ 1 ภาพมีหลายเครื่องมือ → crop รอบ bbox ของชิ้นนั้น
-      (crop คงสัดส่วน/scale เดิม ไม่ใช่การ zoom อิสระ)
+    Important notes:
+    - Length is measured from the *original* mask (before augmentation) because
+      photometric ops / flip should not change the true physical length.
+    - ``flip_flags[label]`` must be True for that class to receive horizontal flip.
+    - ``bbox_margin`` > 0 when one image contains multiple instruments → crop
+      around the bbox of that instance (preserves aspect/scale, not a free zoom).
+      Experiments found bbox_margin ≈ 0.15 effective; image size 504 was the
+      best-performing default in experiments (this class defaults to 224 for
+      backward compatibility — pass 504 explicitly to reproduce those results).
+    - Background is green cloth; shadows on the cloth make tight bounding harder,
+      which is why photometric + shadow augmentation is used.
     """
 
     def __init__(self, records: List[dict], length_stats: Tuple[float, float],
@@ -291,7 +320,7 @@ class SurgicalInstrumentDataset(Dataset):
         self.tensor_tf = build_tensor_transform(img_size)
         self.aug = build_photometric_aug() if training else None
         self.flip_flags = flip_flags
-        # วัดความยาวครั้งเดียวตอนสร้าง dataset (rasterize polygon ใน memory เร็วมาก)
+        # Measure length once at dataset creation (rasterizing polygons in memory is very fast)
         self._lengths = record_lengths(records, calibration_ratio)
 
     def __len__(self) -> int:
@@ -309,20 +338,20 @@ class SurgicalInstrumentDataset(Dataset):
         r = self.records[idx]
         img = cv2.imread(r["image_path"], cv2.IMREAD_COLOR)
         if img is None:
-            raise IOError(f"อ่านภาพไม่สำเร็จ: {r['image_path']}")
+            raise IOError(f"Failed to read image: {r['image_path']}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         if self.bbox_margin > 0:
             img = self._maybe_crop(img, r)
         if self.training:
-            if random.random() < 0.5:               # เงาพื้นเขียว (โจทย์จริง: แสง/เงาเป็นปัญหาหลัก)
+            if random.random() < 0.5:               # green-cloth shadow (real difficulty: lighting/shadow is the main challenge, not a silver tray)
                 img = simulate_shadow(img)
             img = self.aug(image=img)["image"]
-            # horizontal flip แบบ per-class (เฉพาะ class ที่ไม่มีปัญหา handedness)
+            # per-class horizontal flip (only for classes without handedness issues)
             if self.flip_flags is not None and self.flip_flags[r["label"]] and random.random() < 0.5:
                 img = np.ascontiguousarray(img[:, ::-1, :])
 
-        # tensor หลัก
+        # main tensor
         tensor = self.tensor_tf(image=img)["image"]
         length_norm = (self._lengths[idx] - self.length_mean) / self.length_std
         out = {
@@ -330,7 +359,7 @@ class SurgicalInstrumentDataset(Dataset):
             "length": torch.tensor(length_norm, dtype=torch.float32),
             "label": torch.tensor(r["label"], dtype=torch.long),
         }
-        # SEF: คำนวณ Scharr edge map จากภาพหลัง augment/flip แล้ว resize เป็น img_size
+        # SEF: compute Scharr edge map from the augmented/flipped image then resize to img_size
         if self.use_sef:
             gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             edge = scharr_edge_map(gray)  # (H,W) float [0,1]
@@ -343,8 +372,9 @@ class SurgicalInstrumentDataset(Dataset):
 def visualize_records(records: List[dict], calibration_ratio: Optional[float] = None,
                       n: int = 6, cols: int = 3, seed: int = 0):
     """
-    แสดงภาพ + เส้น outline ของ mask + ความยาวที่วัดได้ — ใช้เช็คว่า
-    annotation/การวัดความยาวถูกต้อง ก่อนเทรนจริง (คืน matplotlib figure)
+    Display image + mask outline + measured length — use to verify that
+    annotation / length measurement is correct before real training
+    (returns a matplotlib figure).
     """
     import matplotlib.pyplot as plt
     rng = random.Random(seed)

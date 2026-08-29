@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-evaluate.py — ประเมิน checkpoint ที่เทรนแล้ว
+evaluate.py — Evaluate a trained checkpoint
 
-ใช้จาก notebook/สคริปต์:
+Usage from notebook/script:
     from evaluate import evaluate_checkpoint
     metrics = evaluate_checkpoint("outputs/best_model.pt")
 
-ได้ทั้ง accuracy รวม, classification report ราย class, confusion matrix
-(heatmap) และ "คู่ class ที่สับสนบ่อยสุด" ซึ่งมักเป็นคู่ที่ต่างกันแค่ขนาด
+Returns overall accuracy, per-class classification report, confusion matrix
+(heatmap) and "most frequently confused class pairs" which are often pairs
+differing only in size.
 """
 import os
 from dataclasses import replace
@@ -29,14 +30,14 @@ from train import resolve_records, torch_load_compat
 
 def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
     """
-    โหลด checkpoint → สร้าง model + ArcFace head ให้พร้อม inference
-    (cfg ถูกเก็บไว้ใน checkpoint เวลาเทรน → reproduce โครงสร้างได้เป๊ะ)
+    Load checkpoint -> build model + ArcFace head ready for inference
+    (cfg is stored in the checkpoint at training time -> structure can be reproduced exactly)
     """
     ckpt = torch_load_compat(ckpt_path)
     cfg = TrainConfig(**ckpt["cfg"])
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ต้องสร้างด้วย finetune_mode เดิม เพื่อให้ชื่อ key ของ state_dict ตรงกัน
+    # Must be created with the original finetune_mode so that state_dict keys match
     model = SurgicalDinoFusion(
         backbone_name=cfg.backbone_name, finetune_mode=cfg.finetune_mode,
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
@@ -53,8 +54,8 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
     try:
         arcface.load_state_dict(ckpt["arcface_state"])
     except Exception:
-        # ถ้าเทรนด้วย LGMS (AdaptiveArcFace) แต่ประเมินด้วย ArcFace ปกติ — W ยังโหลดได้
-        # ลองโหลดแบบ strict=False
+        # If trained with LGMS (AdaptiveArcFace) but evaluated with standard ArcFace — W can still be loaded
+        # Try loading with strict=False
         arcface.load_state_dict(ckpt["arcface_state"], strict=False)
     arcface.to(device)
 
@@ -65,7 +66,7 @@ def load_bundle(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
 
 @torch.no_grad()
 def predict_all(bundle: dict, records: List[dict]):
-    """รันทั้ง validation set → (y_true, y_pred, confidence ของ class ที่ทำนาย)"""
+    """Run over the entire validation set -> (y_true, y_pred, confidence of the predicted class)"""
     cfg = bundle["cfg"]
     device = bundle["device"]
     length_stats = (bundle["length_mean"], bundle["length_std"])
@@ -94,7 +95,7 @@ def predict_all(bundle: dict, records: List[dict]):
 
 def plot_confusion_matrix(cm: np.ndarray, class_names: List[str],
                           save_path: Optional[str] = None, figsize=(12, 10)):
-    """heatmap ของ confusion matrix (seaborn ถ้ามี, ไม่มีก็ matplotlib ล้วน)"""
+    """Heatmap of the confusion matrix (uses seaborn if available, otherwise pure matplotlib)"""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=figsize)
     try:
@@ -114,28 +115,28 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: List[str],
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=130, bbox_inches="tight")
-        print(f"[log] บันทึก confusion matrix → {save_path}")
+        print(f"[log] Saved confusion matrix -> {save_path}")
     return fig
 
 
 def print_top_confused(cm: np.ndarray, class_names: List[str], top_n: int = 10) -> None:
-    """พิมพ์คู่ class ที่สับสนบ่อยสุด (จริง → ทำนาย) — จุดที่ต้องแก้ต่อ เช่น เพิ่มฟีเจอร์ขนาด"""
+    """Print the most frequently confused class pairs (true -> predicted) — indicates what to fix next, e.g. adding size features"""
     pairs = [(int(cm[i, j]), i, j)
              for i in range(len(class_names)) for j in range(len(class_names))
              if i != j and cm[i, j] > 0]
     if not pairs:
-        print("ไม่มีความสับสนข้าม class เลย 🎉")
+        print("No cross-class confusion at all 🎉")
         return
     pairs.sort(reverse=True)
-    print("\nคู่ class ที่สับสนบ่อยสุด (จริง → ทำนาย):")
+    print("\nMost confused class pairs (true -> predicted):")
     for cnt, i, j in pairs[:top_n]:
-        print(f"  {class_names[i]} → {class_names[j]} : {cnt} ครั้ง")
+        print(f"  {class_names[i]} -> {class_names[j]} : {cnt} times")
 
 
 def evaluate_checkpoint(ckpt_path: str, data_dir: Optional[str] = None,
                         show_plot: bool = True, save_dir: Optional[str] = None) -> dict:
     """
-    ประเมิน checkpoint บน validation set → dict ที่มี
+    Evaluate checkpoint on the validation set -> dict containing
       accuracy / balanced_accuracy / report / confusion_matrix / cm_path / fig
     """
     bundle = load_bundle(ckpt_path)
@@ -144,7 +145,7 @@ def evaluate_checkpoint(ckpt_path: str, data_dir: Optional[str] = None,
         cfg = replace(cfg, data_dir=data_dir)
     _, va_records, _ = resolve_records(cfg)
     if len(va_records) == 0:
-        raise ValueError("validation set ว่าง — เช็ค data_dir/val_fraction")
+        raise ValueError("validation set is empty — check data_dir/val_fraction")
 
     y_true, y_pred, _ = predict_all(bundle, va_records)
     classes = bundle["classes"]

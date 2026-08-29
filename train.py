@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-train.py — training loop สำหรับ DINOv2 + length fusion + ArcFace
+train.py — training loop for DINOv2 + length fusion + ArcFace
 
-ใช้จาก notebook/สคริปต์:
+Dataset context: instruments on green cloth background — shadows make tight
+bounding challenging (not silver tray). Defaults img_size=504 and
+bbox_margin=0.15 come from experiments (must be divisible by 14 for ViT patch size).
+
+Usage from notebook/script:
     from config import TrainConfig
     from train import run_training
     best_ckpt = run_training(TrainConfig(data_dir="/content/dataset"))
 
-หรือ CLI:
+Or via CLI:
     python train.py --data_dir dataset --epochs 50 --finetune_mode lora
     python train.py --data_dir dataset --kfold 5     # Stratified k-fold CV
 """
@@ -34,7 +38,7 @@ from model import AdaptiveArcFaceLoss, SurgicalDinoFusion, arcface_logits, count
 
 # ============================================================ utils
 def seed_everything(seed: int) -> None:
-    """fix seed ของทุก RNG เพื่อ reproduce ผล (สำคัญเมื่อข้อมูลน้อย split เปลี่ยน = ผลเปลี่ยน)"""
+    """Fix seeds for all RNGs to ensure reproducibility (critical with small data — different splits change results)"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,17 +47,17 @@ def seed_everything(seed: int) -> None:
 
 def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
     """
-    Mixup: สุ่ม interpolation ระหว่าง sample คู่สุ่ม
+    Mixup: random interpolation between randomly paired samples
     x: image tensor (B,3,H,W) | y: label (B,)
     return: mixed_x, y_a, y_b, lam (lambda = interpolation ratio)
 
-    สำคัญสำหรับข้อมูลน้อย: ช่วย regularization โดย "เบลอ" ระหว่าง class
-    alpha=0.4 → lam ~ Beta(0.4, 0.4) มักจะอยู่ใกล้ 0 หรือ 1 (ไม่กลาง太多)
+    Important for small datasets: helps regularization by "blending" between classes
+    alpha=0.4 → lam ~ Beta(0.4, 0.4) usually near 0 or 1 (not in the middle)
     """
     if alpha <= 0:
         return x, y, y, 1.0
     lam = np.random.beta(alpha, alpha)
-    lam = max(lam, 1.0 - lam)  # ให้ lam >= 0.5 เสมอ เพื่อไม่ให้ label สลับกัน
+    lam = max(lam, 1.0 - lam)  # ensure lam >= 0.5 so labels don't swap
     batch_size = x.size(0)
     index = torch.randperm(batch_size, device=x.device)
     mixed_x = lam * x + (1 - lam) * x[index]
@@ -62,7 +66,7 @@ def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
 
 
 def torch_load_compat(path: str) -> dict:
-    """torch.load ที่รองรับทั้ง torch เก่า/ใหม่ (default weights_only เปลี่ยนใน torch 2.6)"""
+    """torch.load compatible with both old and new torch (default weights_only changed in torch 2.6)"""
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -70,30 +74,30 @@ def torch_load_compat(path: str) -> dict:
 
 
 def build_flip_flags(class_names: List[str], cfg: TrainConfig) -> List[bool]:
-    """flip ได้เฉพาะ class ที่อยู่ใน cfg.flip_allowed (None = flip ได้ทุก class)"""
+    """Only classes listed in cfg.flip_allowed can be flipped (None = all classes can be flipped)"""
     allowed = set(cfg.flip_allowed) if cfg.flip_allowed is not None else None
     return [True if allowed is None else n in allowed for n in class_names]
 
 
 def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]]:
     """
-    อ่าน records จาก data_dir:
-      - ถ้ามี valid/_annotations.coco.json → ใช้เลย
-      - ถ้าไม่มี → stratified split จาก train ด้วย val_fraction/seed ของ config
+    Load records from data_dir:
+      - if valid/_annotations.coco.json exists → use it directly
+      - otherwise → stratified split from train using val_fraction/seed from config
     """
     tr, classes = load_coco_records(cfg.data_dir, "train")
     valid_ann = os.path.join(cfg.data_dir, "valid", "_annotations.coco.json")
     if os.path.exists(valid_ann):
         va, classes_valid = load_coco_records(cfg.data_dir, "valid")
         if classes_valid != classes:
-            raise ValueError(f"รายชื่อ class ต่างกันระหว่าง train/valid:\n{classes}\n{classes_valid}")
+            raise ValueError(f"Class lists differ between train/valid:\n{classes}\n{classes_valid}")
     else:
         tr, va = stratified_split(tr, cfg.val_fraction, cfg.seed)
-        print(f"[data] ไม่มีโฟลเดอร์ valid/ → stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
+        print(f"[data] no valid/ folder → stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
     return tr, va, classes
 
 def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
-    """LR schedule: linear warmup → cosine decay ลงจนเกือบ 0 ตอนจบ"""
+    """LR schedule: linear warmup → cosine decay to near 0 by the end"""
     if step < warmup:
         return step / max(1, warmup)
     t = min((step - warmup) / max(1, total - warmup), 1.0)
@@ -103,8 +107,8 @@ def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
 # ============================================================ CAHM helpers
 def _cahm_d_from_cm(cm: np.ndarray) -> np.ndarray:
     """
-    คำนวณ pair difficulty จาก confusion matrix:
-      d(i,j) = C[i,j] + C[j,i]  (i!=j), normalize ด้วย max
+    Compute pair difficulty from confusion matrix:
+      d(i,j) = C[i,j] + C[j,i]  (i!=j), normalized by max
     """
     C = cm.astype(np.float64)
     n = C.shape[0]
@@ -124,7 +128,7 @@ def _cahm_weights(labels: torch.Tensor, d_t: np.ndarray, alpha: float, device) -
     if d_t is None:
         return torch.ones_like(labels, dtype=torch.float32)
     d = torch.as_tensor(d_t, device=device, dtype=torch.float32)  # (C,C)
-    # max ต่อแถว (ไม่นับ diagonal ที่เป็น 0 อยู่แล้ว)
+    # row-wise max (diagonal is already 0, so no need to exclude)
     row_max = d.max(dim=1).values  # (C,)
     w = 1.0 + alpha * row_max[labels]
     return w
@@ -132,7 +136,7 @@ def _cahm_weights(labels: torch.Tensor, d_t: np.ndarray, alpha: float, device) -
 
 @torch.no_grad()
 def _eval_confusion(model, loss_fn, loader, device, num_classes: int) -> np.ndarray:
-    """รันทั้ง validation set เพื่อสร้าง confusion matrix สำหรับ CAHM"""
+    """Run over the full validation set to build a confusion matrix for CAHM"""
     from sklearn.metrics import confusion_matrix
     model.eval()
     ys_true, ys_pred = [], []
@@ -153,7 +157,7 @@ def _eval_confusion(model, loss_fn, loader, device, num_classes: int) -> np.ndar
 # ============================================================ epochs
 def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device, cfg,
                     cahm_d: Optional[np.ndarray] = None) -> float:
-    """เทรน 1 epoch → คืนค่า loss เฉลี่ย (ArcFace บน embedding จาก fusion head)"""
+    """Train for 1 epoch → return average loss (ArcFace on embeddings from the fusion head)"""
     model.train()
     total, seen = 0.0, 0
     mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
@@ -168,8 +172,8 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
         if edge is not None:
             edge = edge.to(device, non_blocking=True)
 
-        # Mixup: สุ่ม interpolate ข้อมูล 2 ตัวอย่าง (regularization สำหรับข้อมูลน้อย)
-        use_mixup = mixup_alpha > 0 and model.training and not use_cahm  # ปิด mixup เมื่อใช้ CAHM เพื่อให้ weight ชัดเจน
+        # Mixup: randomly interpolate between 2 samples (regularization for small datasets)
+        use_mixup = mixup_alpha > 0 and model.training and not use_cahm  # disable mixup when using CAHM so weights remain clear
         if use_mixup:
             px, y_a, y_b, lam = mixup_data(px, y, mixup_alpha)
         else:
@@ -182,19 +186,19 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
                 if use_mixup:
                     loss = lam * loss_fn(emb.float(), y_a) + (1 - lam) * loss_fn(emb.float(), y_b)
                 elif use_cahm:
-                    # CAHM weighted loss — ดึง per-sample loss แล้วคูณ w
+                    # CAHM weighted loss — retrieve per-sample loss and multiply by w
                     if is_adaptive:
                         d = loss_fn.compute_loss_dict(emb.float(), y)
                         per = d["losses"]  # (B,)
                     else:
-                        # ต้องส่ง ref_emb = embeddings เพื่อผ่าน identity check ของ PML
+                        # must pass ref_emb = embeddings to pass PML identity check
                         ef = emb.float()
                         ld = loss_fn.compute_loss(ef, y, None, ef, y)
                         per = ld["loss"]["losses"]  # (B,)
                     w = _cahm_weights(y, cahm_d, cahm_alpha, device)
                     loss = (per * w).mean()
                 else:
-                    loss = loss_fn(emb.float(), y)  # cast fp32 ก่อนเข้า ArcFace เพื่อ stability
+                    loss = loss_fn(emb.float(), y)  # cast to fp32 before ArcFace for stability
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -250,7 +254,7 @@ def validate(model, loss_fn, loader, device) -> Tuple[float, float]:
     return loss, acc
 
 def save_history_plot(history: dict, out_png: str) -> None:
-    """วาดกราฟ loss/accuracy — fail ได้ (headless) โดยไม่ทำ training ล้ม"""
+    """Plot loss/accuracy — may fail (headless) without crashing training"""
     try:
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(1, 2, figsize=(11, 4))
@@ -261,9 +265,9 @@ def save_history_plot(history: dict, out_png: str) -> None:
         ax[1].set_title("Validation accuracy"); ax[1].set_xlabel("epoch"); ax[1].grid(alpha=.3)
         fig.savefig(out_png, dpi=120, bbox_inches="tight")
         plt.close(fig)
-        print(f"[log] บันทึกกราฟ history → {out_png}")
-    except Exception as e:  # noqa: BLE001 — การวาดกราฟไม่ควรทำให้เทรนพัง
-        print(f"(ข้ามการวาดกราฟ history: {e})")
+        print(f"[log] saved history plot → {out_png}")
+    except Exception as e:  # noqa: BLE001 — plotting should not crash training
+        print(f"(skipping history plot: {e})")
 
 
 # ============================================================ main training entry
@@ -274,21 +278,21 @@ def run_training(cfg: TrainConfig,
     """
     Train once (single split) — returns path of the best checkpoint (highest val accuracy)
 
-    checkpoint มี: model_state, arcface_state, classes, length_mean/std,
-                   cfg (dict), epoch, val_loss, val_acc
+    checkpoint contains: model_state, arcface_state, classes, length_mean/std,
+                         cfg (dict), epoch, val_loss, val_acc
     """
     os.makedirs(cfg.output_dir, exist_ok=True)
     seed_everything(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------- ข้อมูล ----------
+    # ---------- data ----------
     if records_train is None or records_valid is None:
         records_train, records_valid, _ = resolve_records(cfg)
     all_recs = list(records_train) + list(records_valid)
     label2name = {r["label"]: r["class_name"] for r in all_recs}
-    class_names = [label2name[i] for i in range(max(label2name) + 1)]  # index เรียงเสมอ
+    class_names = [label2name[i] for i in range(max(label2name) + 1)]  # indices always sorted
 
-    # mean/std ของความยาว ← จาก train เท่านั้น (กัน leakage)
+    # length mean/std ← from train only (prevent leakage)
     length_stats = compute_length_stats(records_train, cfg.calibration_ratio)
     print(f"[data] train={len(records_train)} val={len(records_valid)} "
           f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
@@ -306,7 +310,7 @@ def run_training(cfg: TrainConfig,
                           num_workers=cfg.num_workers, pin_memory=pin)
     dl_val = DataLoader(ds_val, batch_size=cfg.batch_size, shuffle=False,
                         num_workers=cfg.num_workers, pin_memory=pin)
-    # ---------- โมเดล + loss ----------
+    # ---------- model + loss ----------
     model = SurgicalDinoFusion(
         backbone_name=cfg.backbone_name, finetune_mode=cfg.finetune_mode,
         lora_r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
@@ -316,7 +320,7 @@ def run_training(cfg: TrainConfig,
     ).to(device)
     print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode}, sef={use_sef})")
 
-    # ArcFace — ปกติหรือ LGMS (per-class margin)
+    # ArcFace — standard or LGMS (per-class margin)
     if bool(getattr(cfg, "use_lgms", False)):
         class_means = compute_class_length_means(records_train, cfg.calibration_ratio)
         margins = compute_lgms_margins(class_means, len(class_names),
@@ -325,8 +329,8 @@ def run_training(cfg: TrainConfig,
         loss_fn = AdaptiveArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
                                       margin_per_class=margins, scale=cfg.scale).to(device)
     else:
-        # ArcFace: margin หน่วยองศา (~28.6° = 0.5 rad), s=64 — บังคับ embedding ให้
-        # intra-class แน่น / inter-class ห่าง เหมาะกับ class ที่รูปทรงใกล้กันมาก
+        # ArcFace: margin in degrees (~28.6° = 0.5 rad), s=64 — forces embeddings to have
+        # tight intra-class / wide inter-class separation, suitable for classes with very similar shapes
         loss_fn = ArcFaceLoss(num_classes=len(class_names), embedding_size=model.embed_dim,
                               margin=cfg.margin, scale=cfg.scale).to(device)
     if cfg.finetune_mode == "partial":
@@ -345,29 +349,29 @@ def run_training(cfg: TrainConfig,
         try:
             scaler = torch.amp.GradScaler("cuda")   # torch >= 2.3
         except (AttributeError, TypeError):
-            scaler = torch.cuda.amp.GradScaler()    # fallback torch เก่า
+            scaler = torch.cuda.amp.GradScaler()    # fallback for old torch
     else:
         scaler = None
 
     # ---------- loop + early stopping ----------
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
-    # เลือก best ด้วย "val_acc" (val_loss เป็น tiebreak) — ผ่านการจำลองพบว่าบนข้อมูลน้อย
-    # ArcFace val_loss กับ val_acc แย่งกัน (loss ต่ำสุด ≠ โมเดลดีที่สุด); spec เดิมให้ดู val loss
+    # Select best by "val_acc" (val_loss as tiebreak) — simulations show that on small datasets
+    # ArcFace val_loss and val_acc conflict (lowest loss != best model); original spec used val loss
     best = {"val_loss": float("inf"), "val_acc": -1.0, "epoch": -1, "model": None, "arcface": None}
     bad_epochs = 0
-    cahm_d = None  # (C,C) EMA state สำหรับ CAHM
+    cahm_d = None  # (C,C) EMA state for CAHM
     use_cahm = bool(getattr(cfg, "use_cahm", False))
     cahm_start = int(getattr(cfg, "cahm_start_epoch", 10))
     cahm_beta = float(getattr(cfg, "cahm_beta", 0.9))
 
     for epoch in range(1, cfg.epochs + 1):
-        # ส่ง cahm_d ให้ epoch นี้ถ้าถึงเวลาเริ่มแล้ว
+        # pass cahm_d to this epoch if start time has been reached
         cur_cahm = cahm_d if (use_cahm and epoch > cahm_start and cahm_d is not None) else None
         tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg, cahm_d=cur_cahm)
         vl, va = validate(model, loss_fn, dl_val, device)
         history["train_loss"].append(tl); history["val_loss"].append(vl); history["val_acc"].append(va)
 
-        # CAHM: อัปเดต difficulty หลัง validate (ใช้สำหรับ epoch ถัดไป)
+        # CAHM: update difficulty after validation (for next epoch)
         if use_cahm and epoch >= cahm_start:
             try:
                 cm = _eval_confusion(model, loss_fn, dl_val, device, len(class_names))
@@ -376,7 +380,7 @@ def run_training(cfg: TrainConfig,
                     cahm_d = d_cur
                 else:
                     cahm_d = cahm_beta * cahm_d + (1 - cahm_beta) * d_cur
-                # log คู่สับสน top1 สำหรับดีบัก
+                # log top-1 confused pair for debugging
                 flat = [(i, j, cahm_d[i, j]) for i in range(len(class_names)) for j in range(len(class_names)) if i != j]
                 flat.sort(key=lambda x: -x[2])
                 if flat:
@@ -394,7 +398,7 @@ def run_training(cfg: TrainConfig,
                         arcface={k: v.detach().cpu().clone() for k, v in loss_fn.state_dict().items()})
             bad_epochs = 0
             star = "  *best*"
-            # เซฟทันที — หยุดกลางคันก็ไม่หาย (early-stop ก่อนก็มีไฟล์)
+            # save immediately — checkpoint survives interruption (file exists even with early stop)
             try:
                 ckpt_immediate = os.path.join(cfg.output_dir, f"best_model{tag}.pt")
                 torch.save({
@@ -410,7 +414,7 @@ def run_training(cfg: TrainConfig,
                     "val_acc": float(best["val_acc"]),
                 }, ckpt_immediate)
             except Exception as e:
-                print(f"(ข้ามเซฟ immediate: {e})")
+                print(f"(skipping immediate save: {e})")
         else:
             bad_epochs += 1
         cur_lr = scheduler.get_last_lr()[0]
@@ -418,7 +422,7 @@ def run_training(cfg: TrainConfig,
               f"val_acc={va:.4f} lr={cur_lr:.2e}{star}", flush=True)
 
         if bad_epochs >= cfg.patience:
-            print(f"[early stop] ไม่ปรับปรุง {cfg.patience} epoch — หยุดที่ epoch {epoch}")
+            print(f"[early stop] no improvement for {cfg.patience} epochs — stopping at epoch {epoch}")
             break
 
     # ---------- save best checkpoint ----------
@@ -445,8 +449,8 @@ def run_training(cfg: TrainConfig,
 # ============================================================ k-fold CV
 def run_kfold(cfg: TrainConfig, k: Optional[int] = None) -> Tuple[List[str], List[float]]:
     """
-    Stratified k-fold CV บนข้อมูลทั้งหมด (train∪valid) — แม่นกว่า single split
-    เมื่อข้อมูลมีแค่ ~30 ภาพ/class; คืน (paths, val_acc ต่อ fold)
+    Stratified k-fold CV over all data (train∪valid) — more reliable than single split
+    when there are only ~30 images/class; returns (paths, val_acc per fold)
     """
     from sklearn.model_selection import StratifiedKFold
     tr, va, _ = resolve_records(cfg)
@@ -475,21 +479,21 @@ def run_kfold(cfg: TrainConfig, k: Optional[int] = None) -> Tuple[List[str], Lis
 # ============================================================ CLI
 def main(argv=None) -> None:
     from dataclasses import replace
-    ap = argparse.ArgumentParser(description="เทรน DINOv2+length-fusion+ArcFace จำแนกเครื่องมือผ่าตัด")
+    ap = argparse.ArgumentParser(description="Train DINOv2+length-fusion+ArcFace for surgical instrument classification")
     ap.add_argument("--data_dir", default="dataset")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--img_size", type=int, default=None)
     ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default=None)
-    ap.add_argument("--kfold", type=int, default=None, help="เช่น 5 → Stratified 5-fold CV")
+    ap.add_argument("--kfold", type=int, default=None, help="e.g. 5 → Stratified 5-fold CV")
     ap.add_argument("--calibration_ratio", type=float, default=None,
-                    help="cm/pixel จาก object อ้างอิง (ไม่ใส่ = ใช้ pixel)")
+                    help="cm/pixel from reference object (omit = use pixels)")
     ap.add_argument("--output_dir", default=None)
     ap.add_argument("--seed", type=int, default=None)
-    # CAHM / LGMS / SEF — เปิด/ปิดอัลกอริทึมเสริม
-    ap.add_argument("--use_cahm", action="store_true", help="เปิด CAHM (confusion-aware hard mining)")
-    ap.add_argument("--use_lgms", action="store_true", help="เปิด LGMS (length-gated margin scaling)")
-    ap.add_argument("--use_sef", action="store_true", help="เปิด SEF (Scharr edge fusion)")
+    # CAHM / LGMS / SEF — toggle auxiliary algorithms
+    ap.add_argument("--use_cahm", action="store_true", help="enable CAHM (confusion-aware hard mining)")
+    ap.add_argument("--use_lgms", action="store_true", help="enable LGMS (length-gated margin scaling)")
+    ap.add_argument("--use_sef", action="store_true", help="enable SEF (Scharr edge fusion)")
     ap.add_argument("--cahm_alpha", type=float, default=None)
     ap.add_argument("--cahm_beta", type=float, default=None)
     ap.add_argument("--lgms_gamma", type=float, default=None)
@@ -502,7 +506,7 @@ def main(argv=None) -> None:
             continue
         if v is None:
             continue
-        # store_true flags: False หมายถึงไม่ใส่ → ไม่ override (คงค่าเดิม False)
+        # store_true flags: False means not set → don't override (keep default False)
         if isinstance(v, bool) and not v:
             continue
         overrides[k] = v

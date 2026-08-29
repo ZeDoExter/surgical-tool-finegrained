@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-model.py — DINOv2 backbone + fusion head ที่รวม "ความยาวจาก mask" เข้ากับ embedding
+model.py — DINOv2 backbone + fusion head that fuses "length from mask" into the embedding
 
-สถาปัตยกรรม (v2 — ปรับปรุง):
-    ภาพ → DINOv2 ViT-S/14 → all tokens (257 tokens, 384-dim)
-    → AttentionPooling: multi-head attention เฉพาะ patch tokens → weighted sum → 384-dim
-    mask → measure_length_px() → normalize(mean,std ของ train) → scalar (1-dim)
-    concat(384+1) → DeepFusionHead (LN→Linear→GELU→Dropout→Linear→GELU→Dropout) → 384-dim
-    → ArcFace loss (normalize L2 ทั้ง embedding และ weight class)
+Architecture (v2 — improved):
+    image -> DINOv2 ViT-S/14 -> all tokens (257 tokens, 384-dim)
+    -> AttentionPooling: multi-head attention over patch tokens only -> weighted sum -> 384-dim
+    mask -> measure_length_px() -> normalize(mean,std of train) -> scalar (1-dim)
+    concat(384+1) -> DeepFusionHead (LN->Linear->GELU->Dropout->Linear->GELU->Dropout) -> 384-dim
+    -> ArcFace loss (L2-normalize both embedding and class weights)
+
+    Background: green cloth with shadows (not silver tray) — shadows make bounding-box
+    detection harder; image size 504 and bbox 0.15 are defaults chosen from experiments.
 
 v2 changes:
-  - AttentionPooling แทน CLS-only: เก็บ spatial detail จาก patch tokens ทั้งหมด
-  - DeepFusionHead: 2-layer MLP with LayerNorm สำหรับ fusion ที่ลึกกว่า
-  - รองรับ mask_aux_features: width/height/area/ratio จาก mask (optional, เพิ่ม auxiliary info)
+  - AttentionPooling instead of CLS-only: retains spatial detail from all patch tokens
+  - DeepFusionHead: 2-layer MLP with LayerNorm for deeper fusion
+  - Supports mask_aux_features: width/height/area/ratio from mask (optional, adds auxiliary info)
 
-เหตุผลที่ต้อง fuse ความยาว: resize ภาพเป็น 224×224 ทำให้ข้อมูล "scale จริง" หายไป
-แต่บางคู่ class ต่างกันแค่ควายาว — จึงป้อนความยาวที่วัดจาก mask ตรง ๆ เข้าไปช่วย
+Why fuse length: resizing the image to 224x224 loses the true "real scale" information
+but some class pairs differ only by length — so the length measured from the mask is fed in
+directly to help.
 """
 from typing import List, Optional
 
@@ -49,11 +53,11 @@ except Exception as e:
 
 class AttentionPooling(nn.Module):
     """
-    Multi-head attention pooling บน patch tokens ของ ViT
+    Multi-head attention pooling over ViT patch tokens
 
-    แทนที่จะใช้ CLS token อย่างเดียว — เลือก weight จาก attention
-    เฉพาะ patch tokens (ไม่เอา CLS) เพื่อเก็บ spatial detail
-    ที่จำเป็นสำหรับ fine-grained classification
+    Instead of using the CLS token alone — learn attention weights
+    over patch tokens only (excluding CLS) to retain spatial detail
+    needed for fine-grained classification
     """
 
     def __init__(self, embed_dim: int, num_heads: int = 6, dropout: float = 0.1):
@@ -62,16 +66,16 @@ class AttentionPooling(nn.Module):
             embed_dim, num_heads, dropout=dropout, batch_first=True
         )
         self.norm = nn.LayerNorm(embed_dim)
-        # learnable query — 1 token ที่ attend เข้า patch tokens ทั้งหมด
+        # learnable query — 1 token that attends to all patch tokens
         self.query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, num_tokens, embed_dim) — tokens จาก ViT (รวม CLS)
+        x: (B, num_tokens, embed_dim) — tokens from ViT (including CLS)
         return: (B, embed_dim) — pooled embedding
         """
         B = x.shape[0]
-        # แยก patch tokens (index 1:) ออกจาก CLS (index 0)
+        # Separate patch tokens (index 1:) from CLS (index 0)
         patch_tokens = x[:, 1:, :]   # (B, 256, 384)
         q = self.query.expand(B, -1, -1)  # (B, 1, 384)
         attn_out, _ = self.attn(q, patch_tokens, patch_tokens)  # (B, 1, 384)
@@ -81,10 +85,10 @@ class AttentionPooling(nn.Module):
 
 class DeepFusionHead(nn.Module):
     """
-    Deep fusion head: concat visual embedding + length scalar → project กลับ 384-dim
+    Deep fusion head: concat visual embedding + length scalar -> project back to 384-dim
 
-    v1: Linear(385→384) ชั้นเดียว — เร็วแต่ fusion ตื้น
-    v2: LN → Linear(385→768) → GELU → Dropout → Linear(768→384) → Dropout
+    v1: Linear(385->384) single layer — fast but shallow fusion
+    v2: LN -> Linear(385->768) -> GELU -> Dropout -> Linear(768->384) -> Dropout
     """
 
     def __init__(self, embed_dim: int, aux_dim: int = 1, dropout: float = 0.1):
@@ -110,12 +114,12 @@ class DeepFusionHead(nn.Module):
 
 class SurgicalDinoFusion(nn.Module):
     """
-    DINOv2 backbone (+LoRA/ปลดล็อกบางส่วน) + AttentionPooling + DeepFusionHead
+    DINOv2 backbone (+LoRA/partial unfreeze) + AttentionPooling + DeepFusionHead
 
     finetune_mode:
-      - "lora":    หลอด backbone ด้วย LoRA (train ~เฉพาะ adapter, พารามิเตอร์น้อยมาก)
-      - "partial": freeze ทั้ง backbone แล้วปลดล็อก N block ท้าย + final LayerNorm
-      - "frozen":  freeze backbone ทั้งหมด (ใช้เป็น feature extractor อย่างเดียว)
+      - "lora":    Wrap backbone with LoRA (train only adapters, very few parameters)
+      - "partial": Freeze entire backbone then unfreeze last N blocks + final LayerNorm
+      - "frozen":  Freeze entire backbone (use as feature extractor only)
     """
 
     def __init__(self,
@@ -130,10 +134,10 @@ class SurgicalDinoFusion(nn.Module):
                  use_sef: bool = False,
                  sef_out_dim: int = 64):
         super().__init__()
-        assert finetune_mode in ("frozen", "partial", "lora"), f"mode ไม่ถูกต้อง: {finetune_mode}"
+        assert finetune_mode in ("frozen", "partial", "lora"), f"invalid mode: {finetune_mode}"
 
         self.backbone = Dinov2Model.from_pretrained(backbone_name)
-        self.embed_dim = self.backbone.config.hidden_size  # 384 สำหรับ dinov2-small
+        self.embed_dim = self.backbone.config.hidden_size  # 384 for dinov2-small
         self.use_attention_pool = use_attention_pool
         self.use_sef = use_sef
 
@@ -150,7 +154,7 @@ class SurgicalDinoFusion(nn.Module):
                 r=lora_r,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
-                target_modules=["query", "value"],  # LoRA เฉพาะ projection ของ attention
+                target_modules=["query", "value"],  # LoRA only on attention query/value projections
                 bias="none",
             )
             self.backbone = get_peft_model(self.backbone, lora_cfg)
@@ -160,20 +164,20 @@ class SurgicalDinoFusion(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-        # Attention pooling: aggregate patch tokens → 384-dim
+        # Attention pooling: aggregate patch tokens -> 384-dim
         self.attn_pool = AttentionPooling(self.embed_dim, num_heads=6, dropout=head_dropout) if use_attention_pool else None
-        # SEF branch (ถ้าเปิด)
+        # SEF branch (if enabled)
         self.edge_branch = None
         if use_sef:
             if not _EDGE_AVAILABLE:
                 raise ImportError("use_sef=True requires edge_branch.py")
             self.edge_branch = ScharrEdgeBranch(out_dim=sef_out_dim, dropout=head_dropout)
-        # Deep fusion head: concat(384 + 1 + 64_if_sef) → 384
+        # Deep fusion head: concat(384 + 1 + 64_if_sef) -> 384
         aux_dim = 1 + (sef_out_dim if use_sef else 0)
         self.fusion = DeepFusionHead(self.embed_dim, aux_dim=aux_dim, dropout=head_dropout)
 
     def _freeze_partial(self, k: int) -> None:
-        """freeze ทั้ง backbone แล้วปลดล็อกเฉพาะ k block ท้าย + final layernorm"""
+        """Freeze entire backbone then unfreeze only last k blocks + final layernorm"""
         for p in self.backbone.parameters():
             p.requires_grad = False
         for block in self.backbone.encoder.layer[-k:]:
@@ -185,17 +189,17 @@ class SurgicalDinoFusion(nn.Module):
     def forward(self, pixel_values: torch.Tensor, length_feat: torch.Tensor,
                 edge_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        pixel_values: (B,3,H,W) normalize แล้ว | length_feat: (B,) normalized length
-        edge_map: (B,1,H,W) Scharr edge [0,1] ถ้า use_sef=True — ถ้า None จะใช้ศูนย์แทน
-        return: embedding (B, embed_dim=384) สำหรับเข้า ArcFace loss
+        pixel_values: (B,3,H,W) normalized | length_feat: (B,) normalized length
+        edge_map: (B,1,H,W) Scharr edge [0,1] if use_sef=True — if None, zeros are used instead
+        return: embedding (B, embed_dim=384) for ArcFace loss
         """
         out = self.backbone(pixel_values=pixel_values).last_hidden_state  # (B, tokens, 384)
-        # Attention pooling: attend เฉพาะ patch tokens แทน CLS-only
+        # Attention pooling: attend only to patch tokens instead of CLS-only
         if self.attn_pool is not None:
             e = self.attn_pool(out)        # (B, 384)
         else:
             e = out[:, 0]                   # CLS token fallback
-        # Fusion: concat visual embedding + length scalar (+ edge 64 ถ้า SEF)
+        # Fusion: concat visual embedding + length scalar (+ 64 edge features if SEF)
         if self.use_sef and self.edge_branch is not None and edge_map is not None:
             ef = self.edge_branch(edge_map)  # (B, 64)
             aux = torch.cat([length_feat.unsqueeze(1), ef], dim=1)  # (B, 65)
@@ -205,9 +209,9 @@ class SurgicalDinoFusion(nn.Module):
 
     def param_groups(self, lr_head: float, lr_backbone: Optional[float] = None) -> List[dict]:
         """
-        แยกกลุ่มพารามิเตอร์เพื่อใช้ learning rate ต่างกัน:
+        Split parameter groups for differential learning rates:
           - head (attention_pool + fusion + edge_branch): lr_head
-          - backbone ที่ requires_grad=True (LoRA adapter หรือ block ที่ปลดล็อก): lr_backbone
+          - backbone where requires_grad=True (LoRA adapter or unfrozen blocks): lr_backbone
         """
         head_params = []
         if self.attn_pool is not None:
@@ -223,22 +227,22 @@ class SurgicalDinoFusion(nn.Module):
 
 def arcface_logits(loss_fn, embeddings: torch.Tensor) -> torch.Tensor:
     """
-    logits ตอน evaluate/inference: ``s · cos(θ)`` (ไม่มี margin — margin ใช้ตอน train เท่านั้น)
+    Logits at evaluate/inference: ``s · cos(θ)`` (no margin — margin is used only during training)
 
-    ใช้ ``loss_fn.get_cosine()`` ของ pytorch-metric-learning โดยตรง — CosineSimilarity
-    ของ lib normalize ทั้ง embedding และ weight (W เก็บ shape (emb_dim, num_classes))
-    ให้เอง จึงถูกต้องบน "มุม" ทุกเวอร์ชันของ lib
+    Uses ``loss_fn.get_cosine()`` from pytorch-metric-learning directly — CosineSimilarity
+    of the library normalizes both embedding and weight (W stored as shape (emb_dim, num_classes))
+    itself, so it is correct on the "angle" for every version of the library
     """
-    cos = loss_fn.get_cosine(embeddings)  # (B, num_classes), cos ของมุมระหว่างเวกเตอร์
+    cos = loss_fn.get_cosine(embeddings)  # (B, num_classes), cosine of angle between vectors
     return cos * loss_fn.scale
 
 
 class AdaptiveArcFaceLoss(torch.nn.Module):
     """
-    ArcFace แบบ per-class margin (สำหรับ LGMS)
+    Per-class margin ArcFace (for LGMS)
 
-    margin_per_class: list/array ขนาด num_classes หน่วยองศา
-    แต่ละ sample ใช้ margin ของ label ตัวเอง
+    margin_per_class: list/array of size num_classes in degrees
+    Each sample uses the margin of its own label
     """
     def __init__(self, num_classes: int, embedding_size: int,
                  margin_per_class: List[float], scale: float = 64.0):
@@ -251,7 +255,7 @@ class AdaptiveArcFaceLoss(torch.nn.Module):
         self.margin_per_class = np.array(margin_per_class, dtype=np.float64)
         self.margins_rad = np.radians(self.margin_per_class)
         self.W = torch.nn.Parameter(torch.Tensor(embedding_size, num_classes))
-        # Xavier init เหมือน pytorch-metric-learning
+        # Xavier init like pytorch-metric-learning
         torch.nn.init.xavier_uniform_(self.W)
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
         self._cosine = CosineSimilarity()
@@ -265,24 +269,24 @@ class AdaptiveArcFaceLoss(torch.nn.Module):
 
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        คืน loss เฉลี่ย (mean) — เรียก compute_loss แบบ per-sample แล้ว mean เอง
-        เพื่อให้ CAHM นำไป weight ต่อได้ (ถ้าต้องการ per-sample loss ให้เรียก compute_loss_dict)
+        Return mean loss — call compute_loss per-sample then mean
+        so CAHM can weight per-sample afterwards (for per-sample loss call compute_loss_dict)
         """
         d = self.compute_loss_dict(embeddings, labels)
         return d["losses"].mean()
 
     def compute_loss_dict(self, embeddings: torch.Tensor, labels: torch.Tensor) -> dict:
         """
-        คืน dict {"losses": (B,) per-sample, "logits": (B,C)}
-        สำหรับ CAHM ที่ต้อง weight ราย sample
+        Return dict {"losses": (B,) per-sample, "logits": (B,C)}
+        for CAHM that needs per-sample weighting
         """
         dtype, device = embeddings.dtype, embeddings.device
-        # ย้าย W/margins ให้ตรง device/dtype
+        # Move W/margins to matching device/dtype
         W = self._c_f.to_device(self.W, device=device, dtype=dtype)
         margins = torch.as_tensor(self.margins_rad, device=device, dtype=dtype)  # (C,)
         # cosine (B, C)
         cosine = self.get_cosine(embeddings)  # internal uses self.W — need to ensure uses moved W; get_cosine uses normalized W directly
-        # แต่ get_cosine ดู self.W เอง — override ให้ใช้ W ที่ย้ายแล้วไม่ได้; ทำ manual:
+        # But get_cosine looks at self.W itself — cannot override to use moved W; do manual:
         emb_norm = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         W_norm = torch.nn.functional.normalize(W, p=2, dim=0)
         cosine = torch.mm(emb_norm, W_norm)
@@ -293,13 +297,13 @@ class AdaptiveArcFaceLoss(torch.nn.Module):
         cosine_target = cosine[mask == 1]  # (B,)
         angles = torch.acos(torch.clamp(cosine_target, -1 + 1e-7, 1 - 1e-7))
         m_per_sample = margins[labels]  # (B,)
-        # cos(theta + m) แบบ ArcFace
+        # cos(theta + m) as in ArcFace
         cos_theta_plus_m = torch.cos(angles + m_per_sample)
         cos_theta = torch.cos(angles)
-        # keep monotonically decreasing (เช่นเดียวกับ ArcFace)
-        # ถ้า theta + m > pi ให้ fallback
+        # keep monotonically decreasing (same as ArcFace)
+        # if theta + m > pi fall back
         cond = angles <= (np.pi - m_per_sample)
-        # m ใน radian ต้องแปลงเป็น tensor สำหรับ sin
+        # m in radians must be converted to tensor for sin
         modified = torch.where(cond, cos_theta_plus_m, cos_theta - m_per_sample * torch.sin(torch.as_tensor(m_per_sample)))
         diff = (modified - cosine_target).unsqueeze(1)  # (B,1)
         logits = cosine + (mask * diff)
@@ -307,12 +311,12 @@ class AdaptiveArcFaceLoss(torch.nn.Module):
         losses = self.cross_entropy(logits, labels)  # (B,)
         return {"losses": losses, "logits": logits, "cosine": cosine}
 
-    # ให้เหมือน pytorch-metric-learning: มี attribute W และ scale สำหรับ arcface_logits
+    # Like pytorch-metric-learning: has attributes W and scale for arcface_logits
     @property
     def W_t(self):
         return self.W.t()
 
 
 def count_trainable(model: nn.Module) -> int:
-    """นับจำนวนพารามิเตอร์ที่ถูกเทรน (ใช้ยืนยันว่า LoRA/frozen ทำงานถูกต้อง)"""
+    """Count number of trainable parameters (used to verify LoRA/frozen is working correctly)"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

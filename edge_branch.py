@@ -2,10 +2,10 @@
 """
 edge_branch.py — Scharr Edge Fusion branch (SEF)
 
-สาขาเล็กสำหรับประมวลผล edge map ที่คำนวณจากภาพ grayscale ด้วย Scharr filter
-แล้วรวมกับ embedding หลัก (DINOv2 + length) เพื่อเน้นรูปทรง/ขอบ
+Small branch for processing edge maps computed from grayscale images using a Scharr filter,
+then fused with the main embedding (DINOv2 + length) to emphasize shape/edges.
 
-Architecture: 3× Conv2d(3×3) + BN + ReLU + GAP → 64-dim vector
+Architecture: 3x Conv2d(3x3) + BN + ReLU + GAP -> 64-dim vector
 """
 import torch
 import torch.nn as nn
@@ -13,8 +13,8 @@ import torch.nn as nn
 
 class ScharrEdgeBranch(nn.Module):
     """
-    รับ edge_map (B, 1, H, W) ค่า float [0,1] — คืน vector (B, 64)
-    ใช้ร่วมกับ DeepFusionHead: concat(384 + 1 + 64) → 384
+    Takes edge_map (B, 1, H, W) with float values in [0,1] — returns vector (B, 64)
+    Used together with DeepFusionHead: concat(384 + 1 + 64) -> 384
     """
     def __init__(self, out_dim: int = 64, dropout: float = 0.1):
         super().__init__()
@@ -35,7 +35,7 @@ class ScharrEdgeBranch(nn.Module):
 
     def forward(self, edge_map: torch.Tensor) -> torch.Tensor:
         """
-        edge_map: (B, 1, H, W) — ถ้า H,W ต่างกันก็ได้ (GAP จะย่อเหลือ 1×1)
+        edge_map: (B, 1, H, W) — H, W may vary (GAP reduces to 1x1)
         return: (B, 64)
         """
         x = self.net(edge_map)  # (B, 64, 1, 1)
