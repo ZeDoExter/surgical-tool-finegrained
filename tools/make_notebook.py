@@ -138,7 +138,8 @@ flip_all = [True] * len(probe_classes)
 @torch.no_grad()
 def embed(recs, training):
     ds = SurgicalInstrumentDataset(recs, probe_stats, cfg0.img_size, CALIB_RATIO,
-                                   flip_all if training else None, training)
+                                   flip_all if training else None, training,
+                                   bbox_margin=cfg0.bbox_margin)
     E, Y = [], []
     for b in DataLoader(ds, batch_size=32, num_workers=2):
         out = probe_model.backbone(pixel_values=b["image"].to(device)).last_hidden_state
