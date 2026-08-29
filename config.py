@@ -43,7 +43,7 @@ class TrainConfig:
     scale: float = 64.0                # s: scale cosine before softmax so gradients don't vanish
 
     # ---------------- CAHM (Confusion-Aware Hard Mining) ----------------
-    use_cahm: bool = True              # enabled by default — from ablation: 0.9590 vs baseline 0.9467, Needle 8→3
+    use_cahm: bool = True
     cahm_alpha: float = 2.0            # extra weight for confused pairs
     cahm_beta: float = 0.9             # EMA smoothing for difficulty score
     cahm_start_epoch: int = 10         # start after this epoch (let confusion stabilize)

@@ -183,7 +183,7 @@ cfg = TrainConfig(
     finetune_mode="lora",     # "lora" (recommended) | "partial" | "frozen"
     epochs=50,
     num_workers=2,
-    use_cahm=True,            # CAHM on by default — from ablation: 0.9590 vs baseline 0.9467, Needle 8→3
+    use_cahm=True,
     # ---- optional extras ----
     # calibration_ratio=CALIB_RATIO,
     # flip_allowed=["class_a", "class_b"],  # only classes that may be flipped (others are not flipped)
@@ -211,7 +211,7 @@ print(f"\\nAccuracy: {metrics['accuracy']:.4f}")'''))
 # ---------------------------------------------------------------- ablation training (Phase 3)
 cells.append(md("""## 5.5) Phase 3 — Ablation (baseline vs CAHM)
 
-CAHM is kept (`use_cahm=True` by default, 0.9590 vs baseline 0.9467, Needle 8→3). Run both to reproduce the table in README.
+CAHM is kept (`use_cahm=True` by default). Run both to reproduce the table in README.
 Each variant early-stops at ~20-35 epochs (patience 12) | 504 px batch 32 on T4 ~7-8 GB — if OOM, batch is automatically reduced to 16.
 """))
 cells.append(code('''from config import TrainConfig
