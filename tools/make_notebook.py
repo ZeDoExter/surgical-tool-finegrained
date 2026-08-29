@@ -9,7 +9,7 @@ import json
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODULES = ["config.py", "dataset.py", "model.py", "train.py", "evaluate.py", "infer.py"]
+MODULES = ["config.py", "dataset.py", "edge_branch.py", "model.py", "train.py", "evaluate.py", "infer.py"]
 OUT = os.path.join(ROOT, "DentalInstrument_DINOv2_ArcFace.ipynb")
 
 
@@ -88,6 +88,15 @@ for mod in MODULES:
     with open(os.path.join(ROOT, mod), encoding="utf-8") as f:
         src = f.read()
     cells.append(code(f"%%writefile {mod}\n{src}" if not src.endswith("\n") else f"%%writefile {mod}\n{src}"))
+
+# also write tools/evaluate_ablation.py for Phase 3 ablation comparison
+cells.append(code("!mkdir -p tools"))
+import pathlib as _pl
+_tool_path = os.path.join(ROOT, "tools", "evaluate_ablation.py")
+if os.path.exists(_tool_path):
+    with open(_tool_path, encoding="utf-8") as _f:
+        _tool_src = _f.read()
+    cells.append(code(f"%%writefile tools/evaluate_ablation.py\n{_tool_src}"))
 
 # ---------------------------------------------------------------- sanity check
 cells.append(md("""## 3) Data sanity check
