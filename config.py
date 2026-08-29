@@ -12,7 +12,7 @@ from typing import List, Optional
 class TrainConfig:
     # ---------------- ข้อมูล ----------------
     data_dir: str = "dataset"          # โฟลเดอร์ที่มี train/ และ valid/ (Roboflow COCO Segmentation export)
-    img_size: int = 504                # ต้องหารด้วย 14 ลงตัว (504=36×14) — ดีสุดจาก kNN sweep 0.7582 (ชนะ 546/616)
+    img_size: int = 504                # ต้องหารด้วย 14 ลงตัว (504=36×14) — จากการทดลองให้ผลดี จึงตั้งเป็น default
     val_fraction: float = 0.2          # ใช้เมื่อไม่มีโฟลเดอร์ valid/ → stratified split จาก train
     calibration_ratio: Optional[float] = None  # cm/pixel — วัดจาก object อ้างอิงที่รู้ขนาดจริง
                                                # (กล้องระยะคงที่ตลอด จึงใช้ค่าเดียวได้ทุกภาพ)

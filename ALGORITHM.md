@@ -38,11 +38,9 @@ length_norm = (length - mean_train) / std_train
 **1.3 Crop รายชิ้น (bbox_margin)**
 ```
 x1,y1,x2,y2 = bbox ของ polygon
-dx,dy = (x2-x1)*m, (y2-y1)*m ; m=0.15 ดีสุด (kNN 0.7582)
+dx,dy = (x2-x1)*m, (y2-y1)*m ; m=0.15 (จากการทดลองให้ผลดี จึงใช้เป็น default)
 crop = image[y1-dy : y2+dy , x1-dx : x2+dx]
-# m=0 → ไม่ crop (kNN 0.307) | 0.15 → ดีสุด | 0.20 → 0.733
 ```
-
 **1.4 Augmentation (train เท่านั้น)**
 ```
 simulate_shadow (เงา blob นุ่ม) p0.5
@@ -50,10 +48,9 @@ CLAHE p0.5 | RandomBrightnessContrast p0.7 | RandomGamma 70-150 p0.7
 HueSaturationValue p0.3 | GaussianBlur p0.2
 HorizontalFlip p0.5 ต่อเมื่อ flip_flags[label]==True
 # ห้าม: RandomResizedCrop / Cutout กลางวัตถุ (ทำลาย scale)
-Resize(img_size, img_size)  # 504=36×14 ดีสุด, ต้องหาร 14 ลงตัว
+Resize(img_size, img_size)  # 504=36×14 (จากการทดลองให้ผลดี, ต้องหาร 14 ลงตัว)
 Normalize(ImageNet) → ToTensorV2
 ```
-
 **1.5 Scharr Edge (ถ้า use_sef)**
 ```
 gray = RGB2GRAY(image หลัง augment/flip)
@@ -63,8 +60,6 @@ edge_resized = resize(edge, (504,504))
 → tensor (1,504,504)
 ```
 
----
-
 ## 2) kNN Probe — `cell 3.5` (ไม่เทรน)
 
 ```
@@ -73,10 +68,8 @@ Etr = CLS(train) ; Eva = CLS(val)
 sim = normalize(Eva) @ normalize(Etr).T
 pred = label[ argmax(sim) ]
 acc = mean(pred==yva)
-# 504/0.15 → 0.7582 | 224→0.7131 | 616→0.7295 | 0.0→0.307
-# acc <0.30 → อย่าเทรน, ลอง img ใหญ่ขึ้น
+# ถ้า acc ต่ำกว่า 0.30 ควรปรับ img_size หรือ backbone ก่อนเทรน
 ```
-
 ---
 
 ## 3) Model — `model.py` + `edge_branch.py`
@@ -172,18 +165,15 @@ TTA ถ้า use_tta: (logits + logits_flip)/2
 ```
 
 ---
-
-## 8) Config ดีสุดตอนนี้ (kNN sweep)
+## 8) Config เริ่มต้น (จากการทดลอง)
 
 ```
-img_size=504 (36×14)  kNN 0.7582 ★
-bbox_margin=0.15       0.307→0.758
+img_size=504 (36×14)
+bbox_margin=0.15
 batch_size=32 (T4) / 16 (1650 4GB fallback)
 finetune_mode=lora r=16
-# 504 ชนะ 518:0.7459 / 560:0.7336 / 546:0.7295 / 616:0.7295 / 224:0.7131
+# ค่าเหล่านี้ได้จากการทดลอง kNN probe ก่อนเทรน
 ```
-
----
 
 ## 9) รันบน Colab
 

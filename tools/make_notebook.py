@@ -169,7 +169,7 @@ from train import run_training, run_kfold
 
 cfg = TrainConfig(
     data_dir=DATA_DIR,
-    img_size=504,            # 504=36×14 — ดีสุดจาก kNN 0.7582 (ชนะ 546/616)
+    img_size=504,            # 504=36×14 — จากการทดลองให้ผลดี
     batch_size=32,
     finetune_mode="lora",     # "lora" (แนะนำ) | "partial" | "frozen"
     epochs=50,
