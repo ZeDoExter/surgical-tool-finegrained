@@ -1,0 +1,27 @@
+{
+  "classes": [
+    "Artery_Forceps",
+    "Cartridge_Syringe",
+    "Cotton_Piler",
+    "Dental_Mirror",
+    "Mandibular_Universal_Forceps_23",
+    "Maxillary_Universal_Forceps_150",
+    "Needle_Holder",
+    "Root_Elevators",
+    "Root_Tip_Elevator_LR",
+    "Root_Tip_Elevator_Straight",
+    "Root_Tip_Pick",
+    "Scapel_Handle",
+    "Suture_Scissors",
+    "Triple_Syringe"
+  ],
+  "length_mean": 565.2544041059274,
+  "length_std": 231.61492588024788,
+  "calibration_ratio": null,
+  "scale": 64.0,
+  "img_size": 560,
+  "real_length_cm": {
+    "Root_Elevators": 15.5,
+    "Root_Tip_Elevator_Straight": 14.5
+  }
+}

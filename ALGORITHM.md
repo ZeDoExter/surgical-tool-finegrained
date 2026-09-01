@@ -35,7 +35,7 @@ COCO (image + polygon) ──► Dataset ──► Model(baseline) ──► Los
 
 4. Augment (train): simulate_shadow, CLAHE, BrightnessContrast, Gamma, Hue, Blur, Flip per class
    No RandomResizedCrop/Cutout (would destroy scale)
-   Resize 504×504 (from kNN probe, must be divisible by 14) → Normalize → ToTensor
+   Resize 560×560 (from kNN probe, must be divisible by 14) → Normalize → ToTensor
 ```
 
 ### 1.2 kNN Probe (check before training, no training)
@@ -48,7 +48,7 @@ acc = mean(pred==true)  # if <0.30, try larger img_size before training
 
 ### 1.3 Model (baseline)
 ```
-image (3,504,504) → DINOv2 ViT-S/14 → tokens (B,257,384)
+image (3,560,560) → DINOv2 ViT-S/14 → tokens (B,257,384)
   → AttentionPooling (6 heads) → e (B,384)
   → concat(e, length_norm) → (B,385) → LayerNorm → Linear→GELU→Linear → emb (B,384)
 
@@ -98,7 +98,7 @@ loss = mean( per_sample_loss * w )
 # mixup is disabled when CAHM is on
 ```
 
-**Result from ablation (1032/244, 504):** baseline 0.9467 (8) → CAHM 0.9590 (3) — kept
+**Result from ablation (v1, 1032/244, 504):** baseline 0.9467 (8) → CAHM 0.9590 (3) — kept
 
 ### 2.2 Tried and removed
 
@@ -109,7 +109,7 @@ loss = mean( per_sample_loss * w )
 **Enable:** CAHM is on by default in `config.py`
 
 ```python
-cfg = TrainConfig(data_dir="dataset", img_size=504, batch_size=32)  # use_cahm=True by default
+cfg = TrainConfig(data_dir="dataset", img_size=560, batch_size=32)  # use_cahm=True by default
 # to run baseline: cfg = TrainConfig(..., use_cahm=False)
 ```
 
@@ -118,7 +118,7 @@ cfg = TrainConfig(data_dir="dataset", img_size=504, batch_size=32)  # use_cahm=T
 ## 3) Default Config (from kNN probe)
 
 ```
-img_size=504 (36×14)
+img_size=560 (40×14) — from kNN probe on full-res data
 bbox_margin=0.15
 batch_size=32 (T4) / 16 (1650 4GB fallback)
 finetune_mode=lora r=16
