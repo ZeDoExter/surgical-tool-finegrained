@@ -25,8 +25,42 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dataset import build_tensor_transform, mask_from_coco_segmentation, measure_length_px
+from dataset import (build_tensor_transform, mask_from_coco_segmentation,
+                     measure_length_px, tip_crop_from_mask)
 from model import arcface_logits
+
+
+# class pairs that share the same true length → tip TTA matters most for them
+TIP_PAIRS = [
+    {"Needle_Holder", "Artery_Forceps"},
+    {"Mandibular_Universal_Forceps_23", "Maxillary_Universal_Forceps_150"},
+]
+
+
+def length_prior_probs(length_cm: Optional[float], classes: List[str],
+                       real_length_cm: dict, sigma_cm: float = 1.2) -> np.ndarray:
+    """
+    Gaussian prior over classes from the measured physical length.
+    p(c) ∝ exp(-(L_meas − L_c)² / (2σ²)) for classes with known real length;
+    unknown-length classes get the max prior (uninformative).
+    """
+    K = len(classes)
+    prior = np.ones(K, dtype=np.float64)
+    if length_cm is None:
+        return prior
+    known = {c: real_length_cm.get(c) for c in classes if real_length_cm.get(c) is not None}
+    if not known:
+        return prior
+    dists = {c: (length_cm - L) ** 2 for c, L in known.items()}
+    worst = max(dists.values())
+    for c, d2 in dists.items():
+        prior[classes.index(c)] = np.exp(-d2 / (2 * sigma_cm ** 2))
+    # classes with unknown length: neutral (max of known priors)
+    neutral = max(prior[classes.index(c)] for c in known)
+    for i in range(K):
+        if classes[i] not in known:
+            prior[i] = neutral
+    return prior / prior.sum()
 
 
 def load_pipeline(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
@@ -59,38 +93,72 @@ def predict_array(pack: dict, image_rgb: np.ndarray,
                   training mean length is used instead (model can still predict
                   but is less accurate for class pairs that differ by size)
 
-    TTA: original + horizontal flip → average logits → more stable than single prediction
+    TTA (v3):
+      1. full view (orig + hflip)
+      2. TIP view: crops of both instrument ends along the mask major axis —
+         the ONLY signal separating same-length pairs (Needle_Holder↔
+         Artery_Forceps, 23↔150): curved vs straight jaws. Tip logits get a
+         2.5× weight when top-2 lands in a tip-critical pair.
+      3. length prior (cm, when calibration_ratio known) multiplies the
+         class probabilities.
     """
     ratio = pack.get("calibration_ratio")
+    length = None
     if mask_gray is not None:
-        length = measure_length_px(mask_gray) * (ratio if ratio else 1.0)
-    else:
-        length = pack["length_mean"]  # neutral fallback
+        length = measure_length_px(mask_gray)
+        if ratio:
+            length = length * ratio
+    ln_norm = ((length if length is not None else pack["length_mean"])
+               - pack["length_mean"]) / pack["length_std"]
 
-    ln = (length - pack["length_mean"]) / pack["length_std"]
-
-    # TTA: original + horizontal flip → average logits
     use_tta = pack.get("cfg", {}).get("use_tta", False) if isinstance(pack.get("cfg"), dict) else False
+    logits_full = _predict_once(pack, image_rgb, ln_norm)
     if use_tta:
-        logits_orig = _predict_once(pack, image_rgb, ln)
-        # horizontal flip of mask as well (if present) — no need to flip length, length is invariant
         img_flip = np.ascontiguousarray(image_rgb[:, ::-1, :])
-        logits_flip = _predict_once(pack, img_flip, ln)
-        logits = (logits_orig + logits_flip) / 2.0
-    else:
-        logits = _predict_once(pack, image_rgb, ln)
+        logits_full = (logits_full + _predict_once(pack, img_flip, ln_norm)) / 2.0
 
-    probs = F.softmax(logits, dim=-1).cpu()
+    # ---- tip TTA ----
+    logits_tip = None
+    if use_tta and mask_gray is not None:
+        try:
+            tip = tip_crop_from_mask(image_rgb, mask_gray, tip_frac=0.45, both_ends=True)
+            if tip is not None and tip.shape[0] >= 16 and tip.shape[1] >= 16:
+                t_orig = _predict_once(pack, tip, ln_norm)
+                t_flip = _predict_once(pack, np.ascontiguousarray(tip[:, ::-1, :]), ln_norm)
+                logits_tip = (t_orig + t_flip) / 2.0
+        except Exception:
+            logits_tip = None
 
-    top3 = probs.topk(3)
+    logits = logits_full
+    probs = F.softmax(logits, dim=-1).cpu().numpy()
+    if logits_tip is not None:
+        probs_tip = F.softmax(logits_tip, dim=-1).cpu().numpy()
+        top2 = np.argsort(probs)[::-1][:2]
+        pair = {pack["classes"][int(i)] for i in top2}
+        tip_weight = 2.5 if any(pair == p for p in TIP_PAIRS) else 1.0
+        blended = probs ** 1.0 * (probs_tip ** tip_weight)
+        blended = blended / blended.sum()
+        probs = blended
+        # geometric mean variant:
+        # probs = np.sqrt(probs * (probs_tip ** tip_weight)); probs /= probs.sum()
+
+    # ---- length prior (cm) ----
+    if ratio and mask_gray is not None:
+        from config import REAL_LENGTH_CM
+        length_cm = measure_length_px(mask_gray) * ratio
+        prior = length_prior_probs(length_cm, pack["classes"], REAL_LENGTH_CM)
+        probs = probs * prior
+        probs = probs / probs.sum()
+
+    top3 = np.argsort(probs)[::-1][:3]
     classes: List[str] = pack["classes"]
     return {
-        "class": classes[int(top3.indices[0])],
-        "confidence": float(top3.values[0]),
-        "top3": [{"class": classes[int(i)], "prob": float(p)}
-                 for p, i in zip(top3.values, top3.indices)],
-        "length_used": float(length),
+        "class": classes[int(top3[0])],
+        "confidence": float(probs[top3[0]]),
+        "top3": [{"class": classes[int(i)], "prob": float(probs[i])} for i in top3],
+        "length_used": float(length if length is not None else pack["length_mean"]),
         "tta_used": use_tta,
+        "tip_tta_used": logits_tip is not None,
     }
 
 

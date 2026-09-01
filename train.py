@@ -3,7 +3,7 @@
 train.py — training loop for DINOv2 + length fusion + ArcFace
 
 Dataset context: instruments on green cloth background — shadows make tight
-bounding challenging (not silver tray). Defaults img_size=504 and
+bounding challenging (not silver tray). Defaults img_size=560 and
 bbox_margin=0.15 come from experiments (must be divisible by 14 for ViT patch size).
 
 Usage from notebook/script:
@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 
 from pytorch_metric_learning.losses import ArcFaceLoss
 
+from config import TrainConfig
 from dataset import SurgicalInstrumentDataset, compute_length_stats, load_coco_records, stratified_split
 from model import SurgicalDinoFusion, arcface_logits, count_trainable
 
@@ -275,12 +276,22 @@ def run_training(cfg: TrainConfig,
           f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
 
     flip_flags = build_flip_flags(class_names, cfg)
-    ds_train = SurgicalInstrumentDataset(records_train, length_stats, cfg.img_size,
-                                         cfg.calibration_ratio, flip_flags, training=True,
-                                         bbox_margin=cfg.bbox_margin)
-    ds_val = SurgicalInstrumentDataset(records_valid, length_stats, cfg.img_size,
-                                       cfg.calibration_ratio, flip_flags=None, training=False,
-                                       bbox_margin=cfg.bbox_margin)
+    ds_train = SurgicalInstrumentDataset(
+        records_train, length_stats, cfg.img_size,
+        cfg.calibration_ratio, flip_flags, training=True,
+        bbox_margin=cfg.bbox_margin,
+        cutmix_prob=getattr(cfg, "cutmix_prob", 0.0),
+        patch_paste_prob=getattr(cfg, "patch_paste_prob", 0.0),
+        patch_paste_max_objects=getattr(cfg, "patch_paste_max_objects", 2),
+        patch_paste_max_overlap=getattr(cfg, "patch_paste_max_overlap", 0.20),
+        tip_zoom_prob=getattr(cfg, "tip_zoom_prob", 0.0),
+        tip_zoom_size=getattr(cfg, "tip_zoom_size", 0.42),
+    )
+    ds_val = SurgicalInstrumentDataset(
+        records_valid, length_stats, cfg.img_size,
+        cfg.calibration_ratio, flip_flags=None, training=False,
+        bbox_margin=cfg.bbox_margin,
+    )
     pin = device.type == "cuda"
     dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
                           num_workers=cfg.num_workers, pin_memory=pin)

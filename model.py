@@ -10,7 +10,7 @@ Architecture (v2 — improved):
     -> ArcFace loss (L2-normalize both embedding and class weights)
 
     Background: green cloth with shadows (not silver tray) — shadows make bounding-box
-    detection harder; image size 504 and bbox 0.15 are defaults chosen from experiments.
+    detection harder; image size 560 and bbox 0.15 are defaults chosen from experiments.
 
 v2 changes:
   - AttentionPooling instead of CLS-only: retains spatial detail from all patch tokens

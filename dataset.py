@@ -20,7 +20,7 @@ Notes:
   instrument placement / light direction and make bounding/segmentation harder
   (harder than a high-contrast silver tray). Photometric + shadow simulation
   targets this difficulty.
-- Experimental defaults found useful elsewhere in the project: image size 504
+- Experimental defaults found useful elsewhere in the project: image size 560
   and bbox margin ~0.15. Defaults in this module are kept for compatibility;
   see Dataset docstring.
 """
@@ -128,6 +128,7 @@ def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]
             "height": int(im["height"]),
             "class_name": cname,
             "label": name_to_label[cname],
+            "coco_json": ann_path,
         })
     return records, class_names
 
@@ -145,7 +146,342 @@ def segmentation_bbox(segmentation, width: int, height: int) -> Tuple[int, int, 
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
+_COCO_CACHE: dict = {}
+
+
+def load_coco_annotations_for_image(record: dict) -> List[dict]:
+    """
+    All annotations (instruments) of the image that `record` belongs to — used by
+    the detector dataset when a real photo contains multiple instruments
+    (the "mix" dataset). Each returned dict has segmentation / class_name /
+    label (label = sorted class index, same numbering as load_coco_records).
+    Falls back to the record itself when the original COCO json is unavailable.
+    The parsed json is cached by path+mtime (a 2,600-image patch-paste json is
+    several MB — re-parsing per sample is slow).
+    """
+    ann_path = record.get("coco_json")
+    if not ann_path or not os.path.exists(ann_path):
+        return [record]
+    mtime = os.path.getmtime(ann_path)
+    entry = _COCO_CACHE.get(ann_path)
+    if entry is None or entry[0] != mtime:
+        with open(ann_path, "r", encoding="utf-8") as f:
+            coco = json.load(f)
+        cat_id_to_name = {c["id"]: c["name"] for c in coco["categories"]}
+        used_names = sorted({cat_id_to_name[a["category_id"]] for a in coco["annotations"]
+                             if a["category_id"] in cat_id_to_name})
+        name_to_label = {n: i for i, n in enumerate(used_names)}
+        img_id_by_file = {im["file_name"]: im["id"] for im in coco["images"]}
+        anns_by_img: dict = {}
+        for a in coco["annotations"]:
+            cname = cat_id_to_name.get(a["category_id"])
+            if cname is None or cname not in name_to_label:
+                continue
+            anns_by_img.setdefault(a["image_id"], []).append({
+                "segmentation": a["segmentation"],
+                "class_name": cname,
+                "label": name_to_label[cname],
+            })
+        entry = (mtime, anns_by_img, img_id_by_file)
+        _COCO_CACHE[ann_path] = entry
+    _, anns_by_img, img_id_by_file = entry
+    iid = img_id_by_file.get(os.path.basename(record["image_path"]))
+    out = anns_by_img.get(iid, [])
+    return out if out else [record]
+
+
+# ============================================================ Mask-Aware Patch-Paste (Copy-Paste) Augmentation
+def extract_instrument_patch(record: dict, pad: int = 3) -> Optional[dict]:
+    """
+    Extract instrument foreground RGB + binary mask from a COCO record.
+    Returns a dictionary with the cropped RGB, mask, label, and class_name.
+    """
+    img = cv2.imread(record["image_path"], cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = img.shape[:2]
+    mask = mask_from_coco_segmentation(record["segmentation"], record["height"], record["width"])
+    x1, y1, x2, y2 = segmentation_bbox(record["segmentation"], record["width"], record["height"])
+
+    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+    x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+    if (x2 - x1) < 4 or (y2 - y1) < 4:
+        return None
+
+    patch_rgb = img[y1:y2, x1:x2].copy()
+    patch_mask = mask[y1:y2, x1:x2].copy()
+
+    return {
+        "rgb": patch_rgb,
+        "mask": patch_mask,
+        "class_name": record["class_name"],
+        "label": record["label"],
+        "width": w,
+        "height": h,
+    }
+
+
+def transform_instrument_patch(
+    patch: dict,
+    scale_range: Tuple[float, float] = (0.85, 1.15),
+    allow_flip: bool = True,
+    rng: Optional[random.Random] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply random scaling, full 360-degree rotation with expanded bounding box,
+    and optional flipping to an instrument patch.
+    """
+    rng = rng or random
+    p_rgb = patch["rgb"]
+    p_mask = patch["mask"]
+    h, w = p_rgb.shape[:2]
+
+    scale = rng.uniform(scale_range[0], scale_range[1])
+    angle = rng.uniform(-180.0, 180.0)
+
+    nh = max(int(h * scale), 4)
+    nw = max(int(w * scale), 4)
+    scaled_rgb = cv2.resize(p_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    scaled_mask = cv2.resize(p_mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+    # Rotate with adjusted bounding box
+    cx, cy = nw / 2.0, nh / 2.0
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    new_w = max(int((nh * sin) + (nw * cos)), 4)
+    new_h = max(int((nh * cos) + (nw * sin)), 4)
+    M[0, 2] += (new_w / 2.0) - cx
+    M[1, 2] += (new_h / 2.0) - cy
+
+    rot_rgb = cv2.warpAffine(
+        scaled_rgb, M, (new_w, new_h), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101
+    )
+    rot_mask = cv2.warpAffine(
+        scaled_mask, M, (new_w, new_h), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+
+    if allow_flip and rng.random() < 0.5:
+        rot_rgb = np.ascontiguousarray(rot_rgb[:, ::-1, :])
+        rot_mask = np.ascontiguousarray(rot_mask[:, ::-1])
+
+    return rot_rgb, rot_mask
+
+
+def patch_paste_augment(
+    target_img: np.ndarray,
+    target_mask: Optional[np.ndarray],
+    patch_pool: List[dict],
+    target_label: Optional[int] = None,
+    flip_flags: Optional[List[bool]] = None,
+    max_pastes: int = 2,
+    max_overlap: float = 0.20,
+    blend_feather: int = 3,
+    rng: Optional[random.Random] = None,
+) -> np.ndarray:
+    """
+    Mask-aware Patch Paste (Copy-Paste):
+    Pastes 1 to max_pastes secondary instrument patches onto target_img (green cloth).
+
+    Key features:
+    - Extracts & rotates exact instrument foregrounds (via COCO polygon segmentation).
+    - Preserves primary target tool visibility by bounding overlap with target_mask.
+    - Feathered Gaussian edge blending for natural lighting integration on green cloth.
+    - Simulates multi-instrument surgical scenes to prevent background overfitting.
+    """
+    if not patch_pool:
+        return target_img
+    rng = rng or random
+    out_img = target_img.copy()
+    h_dst, w_dst = out_img.shape[:2]
+
+    num_pastes = rng.randint(1, max_pastes)
+    candidate_pool = [p for p in patch_pool if target_label is None or p.get("label") != target_label]
+    if not candidate_pool:
+        candidate_pool = patch_pool
+
+    for _ in range(num_pastes):
+        patch = rng.choice(candidate_pool)
+        label = patch.get("label", 0)
+        allow_flip = flip_flags[label] if flip_flags is not None and label < len(flip_flags) else True
+
+        rot_rgb, rot_mask = transform_instrument_patch(
+            patch, scale_range=(0.85, 1.15), allow_flip=allow_flip, rng=rng
+        )
+        ph, pw = rot_rgb.shape[:2]
+
+        if ph >= h_dst or pw >= w_dst:
+            scale_down = min((h_dst - 10) / ph, (w_dst - 10) / pw) * rng.uniform(0.6, 0.9)
+            if scale_down <= 0:
+                continue
+            new_ph = max(int(ph * scale_down), 4)
+            new_pw = max(int(pw * scale_down), 4)
+            rot_rgb = cv2.resize(rot_rgb, (new_pw, new_ph), interpolation=cv2.INTER_LINEAR)
+            rot_mask = cv2.resize(rot_mask, (new_pw, new_ph), interpolation=cv2.INTER_NEAREST)
+            ph, pw = new_ph, new_pw
+
+        if ph >= h_dst or pw >= w_dst or ph < 4 or pw < 4:
+            continue
+
+        best_x, best_y = 0, 0
+        placed = False
+        target_area = np.sum(target_mask > 0) if target_mask is not None else 0
+
+        for _attempt in range(15):
+            x = rng.randint(0, w_dst - pw)
+            y = rng.randint(0, h_dst - ph)
+
+            if target_mask is not None and target_area > 0:
+                target_roi_mask = target_mask[y:y + ph, x:x + pw]
+                overlap = np.sum((rot_mask > 0) & (target_roi_mask > 0))
+                overlap_ratio = overlap / float(target_area)
+                if overlap_ratio <= max_overlap:
+                    best_x, best_y = x, y
+                    placed = True
+                    break
+            else:
+                best_x, best_y = x, y
+                placed = True
+                break
+
+        if not placed:
+            best_x = rng.randint(0, w_dst - pw)
+            best_y = rng.randint(0, h_dst - ph)
+
+        alpha = (rot_mask > 0).astype(np.float32)
+        if blend_feather > 0:
+            k = blend_feather if blend_feather % 2 == 1 else blend_feather + 1
+            alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+        alpha = alpha[..., None]
+
+        brightness_factor = rng.uniform(0.85, 1.15)
+        pasted_rgb = np.clip(rot_rgb.astype(np.float32) * brightness_factor, 0, 255)
+
+        roi = out_img[best_y:best_y + ph, best_x:best_x + pw].astype(np.float32)
+        blended = (1.0 - alpha) * roi + alpha * pasted_rgb
+        out_img[best_y:best_y + ph, best_x:best_x + pw] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    return out_img
+
+
+def cutmix_augment(img: np.ndarray, pool: list,
+                   rng: Optional[random.Random] = None) -> np.ndarray:
+    """
+    Backward-compatible wrapper for patch-paste / CutMix augmentation.
+    """
+    if not pool:
+        return img
+    if isinstance(pool[0], dict) and "rgb" in pool[0]:
+        return patch_paste_augment(img, None, pool, rng=rng)
+    # Fallback to simple random crop paste if pool contains raw images
+    rng = rng or random
+    h, w = img.shape[:2]
+    src = rng.choice(pool)
+    src_h, src_w = src.shape[:2]
+    pw, ph = min(w // 2, src_w), min(h // 2, src_h)
+    if pw < 2 or ph < 2:
+        return img
+    x1, y1 = rng.randint(0, w - pw), rng.randint(0, h - ph)
+    sx1, sy1 = rng.randint(0, src_w - pw), rng.randint(0, src_h - ph)
+    res = img.copy()
+    res[y1:y1 + ph, x1:x1 + pw] = src[sy1:sy1 + ph, sx1:sx1 + pw]
+    return res
+
+
 # ============================================================ Augmentation
+def tip_crop_from_mask(img: np.ndarray, mask: np.ndarray, tip_frac: float = 0.42,
+                      both_ends: bool = False) -> np.ndarray:
+    """
+    Crop a square around an instrument TIP along the mask's major axis.
+
+    Why: Needle_Holder vs Artery_Forceps (and Forceps 23 vs 150) share the same
+    length — the ONLY reliable signal is the tip shape (curved vs straight
+    jaws). A full 560×560 resize shrinks the tip to ~70px; this crop keeps
+    ~230px of tip detail.
+
+    mask : binary (H,W) uint8/bool — instrument mask (from COCO polygon or
+           detector output on the Pi)
+    Returns an RGB crop (tip view). Falls back to the full image if the mask
+    is degenerate.
+    """
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img
+    c = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(c)
+    (cx, cy), (rw, rh), angle = rect
+    length = max(rw, rh)
+    if length < 8:
+        return img
+    # major-axis direction (minAreaRect convention: angle is of the `w` side)
+    if rw >= rh:
+        dirv = np.array([math.cos(math.radians(angle)), math.sin(math.radians(angle))])
+    else:
+        dirv = np.array([-math.sin(math.radians(angle)), math.cos(math.radians(angle))])
+    dirv = dirv / (np.linalg.norm(dirv) + 1e-8)
+    half = length * 0.5
+    p1 = np.array([cx, cy]) - dirv * half
+    p2 = np.array([cx, cy]) + dirv * half
+    end = p1 if not both_ends else None
+    # pick the end (tip) — mask coverage check: the tip end has less mask
+    # coverage in its neighborhood (tips are thin) — simply take both ends
+    # when both_ends, else choose the end whose local mask area is SMALLER
+    # (tips are thin → smaller local area)
+    def local_area(pt: np.ndarray) -> float:
+        r = max(int(length * 0.12), 8)
+        x0, x1 = max(int(pt[0]) - r, 0), min(int(pt[0]) + r, mask.shape[1])
+        y0, y1 = max(int(pt[1]) - r, 0), min(int(pt[1]) + r, mask.shape[0])
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        return float(np.sum(mask[y0:y1, x0:x1] > 0))
+
+    ends = [p1, p2]
+    if not both_ends:
+        end = ends[0] if local_area(ends[0]) <= local_area(ends[1]) else ends[1]
+        ends = [end]
+
+    h, w = img.shape[:2]
+    crops = []
+    side = max(int(length * tip_frac), 24)
+    for pt in ends:
+        x0 = int(max(pt[0] - side / 2, 0)); x1 = int(min(pt[0] + side / 2, w))
+        y0 = int(max(pt[1] - side / 2, 0)); y1 = int(min(pt[1] + side / 2, h))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        crop = img[y0:y1, x0:x1]
+        crops.append(crop)
+    if not crops:
+        return img
+    out = crops[0]
+    if len(crops) > 1:  # both ends → stack vertically (fixed shape for the CNN)
+        h2 = max(c.shape[0] for c in crops)
+        out = np.vstack([cv2.copyMakeBorder(c, 0, h2 - c.shape[0], 0, 0,
+                                            cv2.BORDER_CONSTANT, value=(0, 0, 0))
+                         for c in crops])
+    return out
+
+
+def maybe_tip_zoom(img: np.ndarray, mask: Optional[np.ndarray], prob: float,
+                   tip_frac: float = 0.42, rng: Optional[random.Random] = None) -> np.ndarray:
+    """With `prob`, replace the crop with a zoomed tip view (training-time only)."""
+    if mask is None or prob <= 0:
+        return img
+    r = rng or random
+    if r.random() >= prob:
+        return img
+    try:
+        tip = tip_crop_from_mask(img, mask, tip_frac=tip_frac)
+        if tip is None or tip.shape[0] < 16 or tip.shape[1] < 16:
+            return img
+        return tip
+    except Exception:
+        return img
+
+
 def build_photometric_aug() -> A.Compose:
     """
     Photometric augmentation for training — intentionally stronger than usual
@@ -247,7 +583,7 @@ class SurgicalInstrumentDataset(Dataset):
     - ``flip_flags[label]`` must be True for that class to receive horizontal flip.
     - ``bbox_margin`` > 0 when one image contains multiple instruments → crop
       around the bbox of that instance (preserves aspect/scale, not a free zoom).
-      Experiments found bbox_margin ≈ 0.15 effective; image size 504 was the
+      Experiments found bbox_margin ≈ 0.15 effective; image size 560 was the
       best-performing default in experiments (this class defaults to 224 for
       backward compatibility — pass 504 explicitly to reproduce those results).
     - Background is green cloth; shadows on the cloth make tight bounding harder,
@@ -257,17 +593,38 @@ class SurgicalInstrumentDataset(Dataset):
     def __init__(self, records: List[dict], length_stats: Tuple[float, float],
                  img_size: int = 224, calibration_ratio: Optional[float] = None,
                  flip_flags: Optional[List[bool]] = None, training: bool = True,
-                 bbox_margin: float = 0.0):
+                 bbox_margin: float = 0.0, cutmix_prob: float = 0.0,
+                 patch_paste_prob: float = 0.0, patch_paste_max_objects: int = 2,
+                 patch_paste_max_overlap: float = 0.20,
+                 tip_zoom_prob: float = 0.0, tip_zoom_size: float = 0.42,
+                 coco_json: Optional[str] = None):
         self.records = records
         self.length_mean, self.length_std = length_stats
         self.training = training
         self.bbox_margin = bbox_margin
         self.img_size = img_size
+        # Support both patch_paste_prob and legacy cutmix_prob
+        self.patch_paste_prob = patch_paste_prob if patch_paste_prob > 0 else cutmix_prob if training else 0.0
+        self.patch_paste_max_objects = patch_paste_max_objects
+        self.patch_paste_max_overlap = patch_paste_max_overlap
+        self.cutmix_prob = self.patch_paste_prob
+        self.tip_zoom_prob = tip_zoom_prob if training else 0.0
+        self.tip_zoom_size = tip_zoom_size
+        self.coco_json = coco_json
         self.tensor_tf = build_tensor_transform(img_size)
         self.aug = build_photometric_aug() if training else None
         self.flip_flags = flip_flags
         # Measure length once at dataset creation (rasterizing polygons in memory is very fast)
         self._lengths = record_lengths(records, calibration_ratio)
+        # Pre-load a pool of instrument patches for Mask-Aware Patch-Paste (Copy-Paste)
+        self._patch_pool: List[dict] = []
+        if self.patch_paste_prob > 0 and len(records) > 1:
+            pool_size = min(64, len(records))
+            pool_indices = random.sample(range(len(records)), pool_size)
+            for pi in pool_indices:
+                p = extract_instrument_patch(records[pi])
+                if p is not None:
+                    self._patch_pool.append(p)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -287,15 +644,33 @@ class SurgicalInstrumentDataset(Dataset):
             raise IOError(f"Failed to read image: {r['image_path']}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if self.bbox_margin > 0:
-            img = self._maybe_crop(img, r)
         if self.training:
-            if random.random() < 0.5:               # green-cloth shadow (real difficulty: lighting/shadow is the main challenge, not a silver tray)
+            target_mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
+            # Mask-Aware Patch-Paste (Copy-Paste): paste secondary tools onto green cloth
+            if self.patch_paste_prob > 0 and self._patch_pool and random.random() < self.patch_paste_prob:
+                img = patch_paste_augment(
+                    img, target_mask, self._patch_pool,
+                    target_label=r["label"],
+                    flip_flags=self.flip_flags,
+                    max_pastes=self.patch_paste_max_objects,
+                    max_overlap=self.patch_paste_max_overlap,
+                    blend_feather=3
+                )
+            # TIP-ZOOM on the FULL image+mask (must run before bbox crop —
+            # otherwise mask coords no longer match the cropped image)
+            if self.tip_zoom_prob > 0 and random.random() < self.tip_zoom_prob:
+                img = maybe_tip_zoom(img, target_mask, 1.0, self.tip_zoom_size)
+            elif self.bbox_margin > 0:
+                img = self._maybe_crop(img, r)
+            if random.random() < 0.5:               # green-cloth shadow
                 img = simulate_shadow(img)
             img = self.aug(image=img)["image"]
             # per-class horizontal flip (only for classes without handedness issues)
             if self.flip_flags is not None and self.flip_flags[r["label"]] and random.random() < 0.5:
                 img = np.ascontiguousarray(img[:, ::-1, :])
+        else:
+            if self.bbox_margin > 0:
+                img = self._maybe_crop(img, r)
 
         # main tensor
         tensor = self.tensor_tf(image=img)["image"]
@@ -335,5 +710,56 @@ def visualize_records(records: List[dict], calibration_ratio: Optional[float] = 
         ax.imshow(img)
         ax.set_title(f"{r['class_name']} | {L:.1f} {unit}", fontsize=9)
         ax.axis("off")
+    plt.tight_layout()
+    return fig
+
+
+def visualize_patch_paste_samples(records: List[dict], n: int = 6, cols: int = 3,
+                                  max_pastes: int = 2, seed: int = 42):
+    """
+    Generate and display n sample images with Mask-Aware Patch-Paste augmentation applied.
+    Use in notebooks/Colab to visually inspect how secondary instruments are blended
+    onto the green cloth before starting full training.
+    """
+    import matplotlib.pyplot as plt
+    rng = random.Random(seed)
+    # Pre-extract patch pool
+    pool = []
+    for r in records[:60]:
+        p = extract_instrument_patch(r)
+        if p is not None:
+            pool.append(p)
+
+    picks = rng.sample(records, min(n, len(records)))
+    rows = math.ceil(len(picks) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.0 * rows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(picks):]:
+        ax.axis("off")
+
+    for ax, r in zip(axes, picks):
+        bgr = cv2.imread(r["image_path"], cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        target_mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
+
+        aug_img = patch_paste_augment(
+            img, target_mask, pool,
+            target_label=r["label"],
+            max_pastes=max_pastes,
+            max_overlap=0.20,
+            blend_feather=3,
+            rng=rng,
+        )
+
+        # Highlight target instrument with yellow border
+        cnts, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(aug_img, cnts, -1, (255, 220, 0), 2)
+
+        ax.imshow(aug_img)
+        ax.set_title(f"Target: {r['class_name']}\n(yellow border = main label)", fontsize=9)
+        ax.axis("off")
+
     plt.tight_layout()
     return fig
