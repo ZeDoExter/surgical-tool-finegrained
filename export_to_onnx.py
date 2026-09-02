@@ -24,17 +24,12 @@ import torch
 from evaluate import load_bundle
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="path ของ best_model.pt")
-    ap.add_argument("--out_dir", default="onnx_export")
-    ap.add_argument("--opset", type=int, default=17)
-    args = ap.parse_args()
-
-    os.makedirs(args.out_dir, exist_ok=True)
+def export_all(ckpt: str, out_dir: str = "onnx_export", opset: int = 17) -> str:
+    """Callable export (used by train_all.py --export) — returns onnx path."""
+    os.makedirs(out_dir, exist_ok=True)
 
     print("[1/4] loading checkpoint + building model ...")
-    bundle = load_bundle(args.ckpt, device=torch.device("cpu"))  # export บน CPU พอ ไม่ต้องใช้ GPU
+    bundle = load_bundle(ckpt, device=torch.device("cpu"))  # export บน CPU พอ ไม่ต้องใช้ GPU
     model = bundle["model"]
     arcface = bundle["arcface"]
     cfg = bundle["cfg"]
@@ -51,14 +46,14 @@ def main():
     dummy_px = torch.randn(1, 3, cfg.img_size, cfg.img_size, dtype=torch.float32)
     dummy_len = torch.zeros(1, dtype=torch.float32)
 
-    onnx_path = os.path.join(args.out_dir, "surgical_dino_fusion.onnx")
+    onnx_path = os.path.join(out_dir, "surgical_dino_fusion.onnx")
     torch.onnx.export(
         model,
         (dummy_px, dummy_len),
         onnx_path,
         input_names=["pixel_values", "length_feat"],
         output_names=["embedding"],
-        opset_version=args.opset,
+        opset_version=opset,
         dynamic_axes={
             "pixel_values": {0: "batch"},
             "length_feat": {0: "batch"},
@@ -70,7 +65,7 @@ def main():
     print("[4/4] exporting ArcFace weight + metadata ...")
     # pytorch_metric_learning ArcFaceLoss เก็บ W เป็น shape (embedding_size, num_classes)
     W = arcface.W.detach().cpu().numpy().astype(np.float32)
-    np.save(os.path.join(args.out_dir, "arcface_W.npy"), W)
+    np.save(os.path.join(out_dir, "arcface_W.npy"), W)
 
     from config import REAL_LENGTH_CM
     meta = {
@@ -82,13 +77,23 @@ def main():
         "img_size": int(cfg.img_size),
         "real_length_cm": REAL_LENGTH_CM,
     }
-    with open(os.path.join(args.out_dir, "classifier_meta.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "classifier_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"\nเสร็จแล้ว — เอาไฟล์ทั้งหมดในโฟลเดอร์ '{args.out_dir}' ไปวางที่ Raspberry Pi:")
+    print(f"\nเสร็จแล้ว — เอาไฟล์ทั้งหมดในโฟลเดอร์ '{out_dir}' ไปวางที่ Raspberry Pi:")
     print("  - surgical_dino_fusion.onnx")
     print("  - arcface_W.npy")
     print("  - classifier_meta.json")
+    return onnx_path
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True, help="path ของ best_model.pt")
+    ap.add_argument("--out_dir", default="onnx_export")
+    ap.add_argument("--opset", type=int, default=17)
+    args = ap.parse_args()
+    export_all(args.ckpt, args.out_dir, args.opset)
 
 
 if __name__ == "__main__":

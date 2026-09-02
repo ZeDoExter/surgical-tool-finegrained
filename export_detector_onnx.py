@@ -6,12 +6,12 @@ Run on PC (torch/transformers/peft needed), NOT on the Pi:
     python export_detector_onnx.py --ckpt outputs_detector/best_detector.pt --out_dir pi_final_v3/onnx_export
 
 Outputs:
-  - detector_dino.onnx   : pixel_values (1,3,560,560) → logits (1,15,560,560)
+  - detector_dino.onnx   : pixel_values (1,3,560,560) -> logits (1,15,560,560)
                            (ch0 = fg, ch1..14 = classes; sigmoid + instances in
                             det_postprocess.py on the Pi)
   - detector_meta.json   : classes, img_size, post-processing thresholds,
                            real lengths (cm), calibration_ratio (from calibrate.py)
-LoRA is merged into the backbone before export → clean Dinov2Model graph.
+LoRA is merged into the backbone before export -> clean Dinov2Model graph.
 """
 import argparse
 import json
@@ -24,12 +24,9 @@ from config import REAL_LENGTH_CM
 from det_model import load_detector
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--out_dir", default="pi_final_v3/onnx_export")
-    ap.add_argument("--opset", type=int, default=17)
-    args = ap.parse_args()
+def export_all(ckpt_path: str, out_dir: str, opset: int = 17) -> str:
+    """Callable export (used by train_all.py --export) — returns onnx path."""
+    args = argparse.Namespace(ckpt=ckpt_path, out_dir=out_dir, opset=opset)
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -78,6 +75,16 @@ def main():
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"      saved -> {meta_path}")
+    return onnx_path
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--out_dir", default="pi_final_v3/onnx_export")
+    ap.add_argument("--opset", type=int, default=17)
+    args = ap.parse_args()
+    export_all(args.ckpt, args.out_dir, args.opset)
     print("\nDone — copy the whole folder to the Pi (pi_final_v3/onnx_export).")
 
 

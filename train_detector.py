@@ -2,7 +2,7 @@
 """
 train_detector.py — train the DINOv2 detector (NO YOLO)
 
-Loss per patch (40×40 grid):
+Loss per patch (40x40 grid):
   - CE over (1+C) channels with background down-weighted (bg_weight=0.25):
     most patches are background — plain CE would teach "predict background
     everywhere"; down-weighting balances FG recall.
@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import random
+import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -61,11 +62,16 @@ def detector_loss(logits: torch.Tensor, target: torch.Tensor,
                   dice_weight: float = 1.0) -> Tuple[torch.Tensor, dict]:
     """
     logits: (B, 1+C, g, g) | target: (B, 1+C, g, g) in {0,1}
-    ch0 = fg mask; ch1..C = per-class one-hot (bg patch → all zeros)
+    ch0 = fg mask; ch1..C = per-class one-hot (bg patch -> all zeros)
+
+    NOTE: logits are cast to fp32 FIRST — AMP autocast produces fp16 in the
+    ViT attention/decoder; CE+Dice on fp16 overflow/NaN at batch≥4 on some
+    GPUs (GTX 1650). Computing the loss in fp32 is cheap (small spatial dims).
     """
+    logits = logits.float()
     B, K, g, _ = logits.shape
     # ---- per-patch CE over (bg + C classes) ----
-    # build class index target: bg=0, class c → c+1
+    # build class index target: bg=0, class c -> c+1
     cls_tgt = torch.argmax(target[:, 1:], dim=1) + 1        # (B,g,g) in 1..C
     cls_tgt = torch.where(target[:, 0] > 0.5, cls_tgt, torch.zeros_like(cls_tgt))
     ce_map = F.cross_entropy(logits, cls_tgt, reduction="none")  # (B,g,g)
@@ -100,7 +106,7 @@ def build_real_val_records(data_dir: str) -> List[dict]:
 def validate_instances(model, records: List[dict], classes: List[str],
                        cfg: DetectorConfig, device, max_images: int = 40) -> dict:
     """
-    Full-pipeline validation on real photos: forward → post-process → match.
+    Full-pipeline validation on real photos: forward -> post-process -> match.
     Greedy IoU≥0.30 matching (mask-wise), class counted only for matched pairs.
     Returns {"precision", "recall", "f1", "mean_iou", "confusion", counts}.
     """
@@ -140,7 +146,7 @@ def validate_instances(model, records: List[dict], classes: List[str],
             gt_insts.append({"mask": m_rs, "label": a["label"]})
         n_gt += len(gt_insts)
 
-        # greedy match detections → GT
+        # greedy match detections -> GT
         pairs = []
         for di, inst in enumerate(insts):
             dm = inst["mask"] > 0
@@ -238,12 +244,22 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
     history = {"train_loss": [], "val_f1": [], "val_prec": [], "val_rec": []}
     ckpt_path = os.path.join(cfg.output_dir, "best_detector.pt")
 
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(x, **k):
+            return x
+
     print(f"[train] steps/epoch={len(dl)} epochs={cfg.epochs}")
+    t_train0 = time.time()
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         tot = 0.0
         seen = 0
-        for batch in dl:
+        pbar = tqdm(dl, desc=f"{epoch:03d}/{cfg.epochs}", unit="batch",
+                    bar_format="{l_bar}{bar:20}{r_bar}", leave=False,
+                    dynamic_ncols=True)
+        for batch in pbar:
             px = batch["image"].to(device, non_blocking=True)
             tgt = batch["target"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -267,6 +283,9 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
             scheduler.step()
             tot += loss.item() * px.size(0)
             seen += px.size(0)
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix(loss=f"{loss.item():.3f}",
+                                 ce=f"{parts['ce']:.3f}", dice=f"{parts['dice']:.3f}")
         tr_loss = tot / max(seen, 1)
 
         metrics = validate_instances(model, val_records, classes, cfg, device)
@@ -291,10 +310,13 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
             }, ckpt_path)
         else:
             bad += 1
+        elapsed = time.time() - t_train0
+        eta = elapsed / epoch * (cfg.epochs - epoch) if epoch < cfg.epochs else 0.0
         print(f"[epoch {epoch:03d}/{cfg.epochs}] loss={tr_loss:.4f} "
               f"(ce={parts['ce']:.3f} dice={parts['dice']:.3f}) "
               f"val: P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
-              f"F1={metrics['f1']:.3f} IoU={metrics['mean_iou']:.3f}{star}", flush=True)
+              f"F1={metrics['f1']:.3f} IoU={metrics['mean_iou']:.3f} "
+              f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m{star}", flush=True)
         if bad >= cfg.patience:
             print(f"[early stop] patience {cfg.patience}")
             break
@@ -306,7 +328,22 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
             "classes": classes, "cfg": cfg.to_dict(), "epoch": epoch,
             "val_f1": 0.0, "val_precision": 0.0, "val_recall": 0.0,
         }, ckpt_path)
-    print(f"[done] best epoch={best['epoch']} F1={best['f1']:.4f} → {ckpt_path}")
+
+    # ── YOLO-style summary table ────────────────────────────────
+    total_min = (time.time() - t_train0) / 60
+    print("\n" + "=" * 62)
+    print(f"{'Detector training complete':^62}")
+    print("=" * 62)
+    print(f"{'epochs run:':<24}{epoch}")
+    print(f"{'best epoch:':<24}{best['epoch']}")
+    print(f"{'best val F1:':<24}{best['f1']:.4f}")
+    print(f"{'best val P / R:':<24}"
+          f"{max(hp for hp in history['val_prec']) if history['val_prec'] else 0:.3f} / "
+          f"{max(hr for hr in history['val_rec']) if history['val_rec'] else 0:.3f}")
+    print(f"{'final loss:':<24}{tr_loss:.4f}")
+    print(f"{'total time:':<24}{total_min:.1f} min")
+    print(f"{'saved to:':<24}{ckpt_path}")
+    print("=" * 62)
     return ckpt_path
 
 

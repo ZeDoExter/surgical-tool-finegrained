@@ -49,7 +49,7 @@ def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
     return: mixed_x, y_a, y_b, lam (lambda = interpolation ratio)
 
     Important for small datasets: helps regularization by "blending" between classes
-    alpha=0.4 → lam ~ Beta(0.4, 0.4) usually near 0 or 1 (not in the middle)
+    alpha=0.4 -> lam ~ Beta(0.4, 0.4) usually near 0 or 1 (not in the middle)
     """
     if alpha <= 0:
         return x, y, y, 1.0
@@ -79,8 +79,8 @@ def build_flip_flags(class_names: List[str], cfg: TrainConfig) -> List[bool]:
 def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]]:
     """
     Load records from data_dir:
-      - if valid/_annotations.coco.json exists → use it directly
-      - otherwise → stratified split from train using val_fraction/seed from config
+      - if valid/_annotations.coco.json exists -> use it directly
+      - otherwise -> stratified split from train using val_fraction/seed from config
     """
     tr, classes = load_coco_records(cfg.data_dir, "train")
     valid_ann = os.path.join(cfg.data_dir, "valid", "_annotations.coco.json")
@@ -90,11 +90,11 @@ def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]
             raise ValueError(f"Class lists differ between train/valid:\n{classes}\n{classes_valid}")
     else:
         tr, va = stratified_split(tr, cfg.val_fraction, cfg.seed)
-        print(f"[data] no valid/ folder → stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
+        print(f"[data] no valid/ folder -> stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
     return tr, va, classes
 
 def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
-    """LR schedule: linear warmup → cosine decay to near 0 by the end"""
+    """LR schedule: linear warmup -> cosine decay to near 0 by the end"""
     if step < warmup:
         return step / max(1, warmup)
     t = min((step - warmup) / max(1, total - warmup), 1.0)
@@ -150,14 +150,19 @@ def _eval_confusion(model, loss_fn, loader, device, num_classes: int) -> np.ndar
     return cm
 # ============================================================ epochs
 def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device, cfg,
-                    cahm_d: Optional[np.ndarray] = None) -> float:
-    """Train for 1 epoch → return average loss (ArcFace on embeddings from the fusion head)"""
+                    cahm_d: Optional[np.ndarray] = None, epoch: int = 0,
+                    total_epochs: int = 0, tqdm_mod=None) -> float:
+    """Train for 1 epoch -> return average loss (ArcFace on embeddings from the fusion head)"""
     model.train()
     total, seen = 0.0, 0
     mixup_alpha = getattr(cfg, "mixup_alpha", 0.0)
     use_cahm = bool(getattr(cfg, "use_cahm", False)) and cahm_d is not None
     cahm_alpha = float(getattr(cfg, "cahm_alpha", 2.0))
-    for batch in loader:
+    it = loader
+    if tqdm_mod is not None:
+        it = tqdm_mod(loader, desc=f"cls {epoch:03d}/{total_epochs}", unit="batch",
+                      bar_format="{l_bar}{bar:20}{r_bar}", leave=False, dynamic_ncols=True)
+    for batch in it:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
@@ -169,7 +174,7 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
             y_a, y_b, lam = y, y, 1.0
 
         optimizer.zero_grad(set_to_none=True)
-        if scaler is not None:  # GPU → mixed precision
+        if scaler is not None:  # GPU -> mixed precision
             with torch.autocast("cuda"):
                 emb = model(px, ln)
                 if use_mixup:
@@ -189,7 +194,7 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-        else:  # CPU → fp32
+        else:  # CPU -> fp32
             emb = model(px, ln)
             if use_mixup:
                 loss = lam * loss_fn(emb, y_a) + (1 - lam) * loss_fn(emb, y_b)
@@ -208,6 +213,8 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
 
         total += loss.item() * y.size(0)
         seen += y.size(0)
+        if it is not loader and hasattr(it, "set_postfix"):
+            it.set_postfix(loss=f"{total/max(seen,1):.3f}")
     return total / max(seen, 1)
 
 
@@ -243,7 +250,7 @@ def save_history_plot(history: dict, out_png: str) -> None:
         ax[1].set_title("Validation accuracy"); ax[1].set_xlabel("epoch"); ax[1].grid(alpha=.3)
         fig.savefig(out_png, dpi=120, bbox_inches="tight")
         plt.close(fig)
-        print(f"[log] saved history plot → {out_png}")
+        print(f"[log] saved history plot -> {out_png}")
     except Exception as e:  # noqa: BLE001 — plotting should not crash training
         print(f"(skipping history plot: {e})")
 
@@ -332,6 +339,13 @@ def run_training(cfg: TrainConfig,
 
     # ---------- loop + early stopping ----------
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(x, **k):
+            return x
+    import time as _time
+    t_train0 = _time.time()
     # Select best by "val_acc" (val_loss as tiebreak) — simulations show that on small datasets
     # ArcFace val_loss and val_acc conflict (lowest loss != best model); original spec used val loss
     best = {"val_loss": float("inf"), "val_acc": -1.0, "epoch": -1, "model": None, "arcface": None}
@@ -344,7 +358,8 @@ def run_training(cfg: TrainConfig,
     for epoch in range(1, cfg.epochs + 1):
         # pass cahm_d to this epoch if start time has been reached
         cur_cahm = cahm_d if (use_cahm and epoch > cahm_start and cahm_d is not None) else None
-        tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg, cahm_d=cur_cahm)
+        tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg,
+                             cahm_d=cur_cahm, epoch=epoch, total_epochs=cfg.epochs, tqdm_mod=_tqdm)
         vl, va = validate(model, loss_fn, dl_val, device)
         history["train_loss"].append(tl); history["val_loss"].append(vl); history["val_acc"].append(va)
 
@@ -395,8 +410,11 @@ def run_training(cfg: TrainConfig,
         else:
             bad_epochs += 1
         cur_lr = scheduler.get_last_lr()[0]
+        elapsed = _time.time() - t_train0
+        eta = elapsed / epoch * (cfg.epochs - epoch) if epoch < cfg.epochs else 0.0
         print(f"{tag}[epoch {epoch:03d}/{cfg.epochs}] train={tl:.4f} val={vl:.4f} "
-              f"val_acc={va:.4f} lr={cur_lr:.2e}{star}", flush=True)
+              f"val_acc={va:.4f} lr={cur_lr:.2e} "
+              f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m{star}", flush=True)
 
         if bad_epochs >= cfg.patience:
             print(f"[early stop] no improvement for {cfg.patience} epochs — stopping at epoch {epoch}")
@@ -418,8 +436,22 @@ def run_training(cfg: TrainConfig,
     }, ckpt_path)
     save_history_plot(history, os.path.join(cfg.output_dir, f"history{tag}.png"))
 
+    # ── YOLO-style summary table ────────────────────────────────
+    total_min = (_time.time() - t_train0) / 60
+    print("\n" + "=" * 62)
+    print(f"{'Classifier training complete':^62}")
+    print("=" * 62)
+    print(f"{'epochs run:':<24}{epoch}")
+    print(f"{'best epoch:':<24}{best['epoch']}")
+    print(f"{'best val acc:':<24}{best['val_acc']:.4f}")
+    print(f"{'best val loss:':<24}{best['val_loss']:.4f}")
+    print(f"{'final train loss:':<24}{tl:.4f}")
+    print(f"{'total time:':<24}{total_min:.1f} min")
+    print(f"{'saved to:':<24}{ckpt_path}")
+    print("=" * 62)
+
     print(f"[done] best epoch={best['epoch']} val_loss={best['val_loss']:.4f} "
-          f"val_acc={best['val_acc']:.4f} → {ckpt_path}")
+          f"val_acc={best['val_acc']:.4f} -> {ckpt_path}")
     return ckpt_path
 
 
@@ -462,7 +494,7 @@ def main(argv=None) -> None:
     ap.add_argument("--batch_size", type=int, default=None)
     ap.add_argument("--img_size", type=int, default=None)
     ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default=None)
-    ap.add_argument("--kfold", type=int, default=None, help="e.g. 5 → Stratified 5-fold CV")
+    ap.add_argument("--kfold", type=int, default=None, help="e.g. 5 -> Stratified 5-fold CV")
     ap.add_argument("--calibration_ratio", type=float, default=None,
                     help="cm/pixel from reference object (omit = use pixels)")
     ap.add_argument("--output_dir", default=None)
@@ -479,7 +511,7 @@ def main(argv=None) -> None:
             continue
         if v is None:
             continue
-        # store_true flags: False means not set → don't override (keep default False)
+        # store_true flags: False means not set -> don't override (keep default False)
         if isinstance(v, bool) and not v:
             continue
         overrides[k] = v

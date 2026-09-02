@@ -5,10 +5,10 @@ det_model.py — DINOv2 detector WITHOUT YOLO: backbone + light segmentation hea
 Idea (why this works with 441 images):
     DINOv2 patch features are famously strong for dense prediction "out of the
     box" (linear-probe segmentation). We attach a tiny conv decoder on the
-    40×40 patch grid that predicts, per patch, (1 + num_classes) channels:
+    40x40 patch grid that predicts, per patch, (1 + num_classes) channels:
       ch0  = foreground (instrument) probability
       ch1: = per-class probability
-    → binary mask + per-patch class → connected components → instance
+    -> binary mask + per-patch class -> connected components -> instance
       bbox + label + confidence (like YOLO output, but from segmentation).
 
     Bonus over YOLO for this project: the instance MASK lets us measure the
@@ -17,7 +17,7 @@ Idea (why this works with 441 images):
     feeds the classifier's length fusion + cm calibration.
 
 Decoder cost: ~1.2M params (vs 21M backbone) — keeps realtime on Pi 5
-(one 560×560 forward per frame, then pure numpy/cv2 post-processing).
+(one 560x560 forward per frame, then pure numpy/cv2 post-processing).
 """
 from typing import List, Optional
 
@@ -57,7 +57,7 @@ class SegDecoder(nn.Module):
     Output: (B, 1+C, 560, 560) — sigmoid semantics, trained with BCE-with-logits
             (ch0 = instrument-foreground, ch1.. = per-class).
 
-    Uses 2× pixel-shuffle upsampling steps 40→80→160→320→560-ish, then a final
+    Uses 2x pixel-shuffle upsampling steps 40->80->160->320->560-ish, then a final
     bilinear resize to exactly img_size. All convs are narrow (192-256 ch) so
     the head stays ~1.2M params and exports cleanly to ONNX (Conv, PixelShuffle,
     GroupNorm, SiLU — no exotic ops).
@@ -91,7 +91,7 @@ class SegDecoder(nn.Module):
             in_ch = embed_dim
 
         self.fuse = ConvBNAct(in_ch, mid_dim, 1, dropout)
-        # 40 → 80 → 160, then bilinear to img_size (keeps Pi/1650 VRAM reasonable)
+        # 40 -> 80 -> 160, then bilinear to img_size (keeps Pi/1650 VRAM reasonable)
         self.up1 = self.__decoder_block(mid_dim, decoder_dim, 2, dropout)
         self.up2 = self.__decoder_block(decoder_dim, decoder_dim, 2, dropout)
         self.head = nn.Conv2d(decoder_dim, 1 + num_classes, 1, bias=True)
@@ -179,12 +179,22 @@ class SurgicalDinoDetector(nn.Module):
         """
         pixel_values: (B,3,H,W) ImageNet-normalized
         return: (B, 1+C, H, W) logits (ch0 fg / ch1.. class)
+
+        AMP note: the decoder runs OUTSIDE autocast (fp32). GroupNorm +
+        PixelShuffle in fp16 overflow to NaN at batch>=4 on some GPUs
+        (Turing). The backbone (95% of compute) still benefits from AMP —
+        disabling autocast for the tiny decoder costs almost nothing.
         """
-        out = self.backbone(pixel_values=pixel_values, output_hidden_states=True)
-        last = out.last_hidden_state[:, 1:, :]        # drop CLS → patch tokens
+        with torch.autocast(device_type=pixel_values.device.type, enabled=False):
+            return self._forward_fp32(pixel_values)
+
+    def _forward_fp32(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self.backbone(pixel_values=pixel_values.to(torch.float32),
+                            output_hidden_states=True)
+        last = out.last_hidden_state[:, 1:, :]        # drop CLS -> patch tokens
         mid_tokens = None
         if self.decoder.use_mid_feats:
-            # hidden_states: (embeddings, layer1..layer12) → 6th & 9th block outputs
+            # hidden_states: (embeddings, layer1..layer12) -> 6th & 9th block outputs
             hs = out.hidden_states
             mid_tokens = [hs[6][:, 1:, :], hs[9][:, 1:, :]]
         return self.decoder(last, mid_tokens, grid=self.grid)
@@ -207,7 +217,7 @@ def count_trainable(model: nn.Module) -> int:
 
 
 def load_detector(ckpt_path: str, device: Optional[torch.device] = None) -> dict:
-    """Load detector checkpoint → dict(model, cfg, classes, device) (mirrors evaluate.load_bundle)."""
+    """Load detector checkpoint -> dict(model, cfg, classes, device) (mirrors evaluate.load_bundle)."""
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except TypeError:
