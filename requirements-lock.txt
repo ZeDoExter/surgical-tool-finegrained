@@ -1,0 +1,17 @@
+# Exact versions from the working machine (GTX 1650, CUDA 12.1, Python 3.12)
+# Install via setup_env.bat (creates .venv + installs everything)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+transformers==5.16.1
+peft==0.20.0
+pytorch-metric-learning==2.9.0
+albumentations==2.0.8
+numpy==2.5.2
+scikit-learn==1.9.0
+onnxruntime==1.29.0
+opencv-python-headless==5.0.0.93
+tqdm==4.70.0
+matplotlib==3.11.1
+seaborn==0.13.2
+pillow==12.3.0
