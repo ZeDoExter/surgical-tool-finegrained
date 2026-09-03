@@ -88,7 +88,9 @@ class DinoClassifierONNX:
 
         # cheap first-pass template: skip tip TTA unless the top-2 gap is
         # small AND lands in a same-length pair (the pairs tip TTA exists for)
-        self.tip_gap_threshold = 0.35   # softmax gap below which tips are consulted
+        # 0.20 = strict: most frames answer from the single forward — tips
+        # only for genuinely ambiguous same-length pairs
+        self.tip_gap_threshold = 0.20
 
     def _preprocess(self, rgb_crop: np.ndarray) -> np.ndarray:
         img = cv2.resize(rgb_crop, (self.img_size, self.img_size)).astype(np.float32) / 255.0

@@ -96,10 +96,12 @@ TIP_CRITICAL_PAIRS: List[List[str]] = [
 
 # Confusion-prone classes (from live-camera errors): these get EXTRA
 # augmentation (rotation, tip-zoom, oversampling) during training.
+# Root_Tip_Pick added after live testing (slow/low-confidence answers).
 HARD_CLASSES: List[str] = [
     "Suture_Scissors",
     "Artery_Forceps",
     "Needle_Holder",
+    "Root_Tip_Pick",
 ]
 
 

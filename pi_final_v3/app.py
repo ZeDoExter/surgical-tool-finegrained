@@ -24,6 +24,10 @@ API_KEY = "e5bdb16ce0552c091383244b3c814ffe51bd15fa73e0bc6f4dc7b09afe00a6a67d2bc
 DETECT_DIR = "onnx_export"
 CLASSIFY_DIR = "onnx_export"
 CLASSIFY_REFRESH_SEC = 5.0
+STICKY_CONFIRMED_SEC = 60.0     # once a track is answered CONFIDENTLY, stop
+                                # re-asking the classifier for a minute — tools
+                                # don't change identity on a table
+CLASSIFY_MAX_PER_PASS = 2      # budget per loop pass — never starve the detector
 IOU_MATCH = 0.3
 
 # CPU budget on Pi 5 (4 cores): detector gets the most (it gates the visual
@@ -175,16 +179,22 @@ def classify_loop():
         # resize frame once for tip-crop coordinate space (same as detector)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb_model = cv2.resize(rgb_frame, (detector.img_size, detector.img_size))
-        sx_m = detector.img_size / w
-        sy_m = detector.img_size / h
+        done_this_pass = 0
         for inst in insts:
+            if done_this_pass >= CLASSIFY_MAX_PER_PASS:
+                break   # leave CPU for the detector — rest waits for next pass
             tid = inst.get("track_id")
             if tid is None:
                 continue
             with cache_lock:
                 cached = fine_grained_cache.get(int(tid))
-            if cached is not None and (now - cached["ts"]) < CLASSIFY_REFRESH_SEC:
-                continue
+            if cached is not None:
+                # STICKY: confidently answered recently -> don't re-ask at all
+                if cached.get("confirmed") and (now - cached["ts"]) < STICKY_CONFIRMED_SEC:
+                    continue
+                # low-confidence answers retry at the normal cadence
+                if (now - cached["ts"]) < CLASSIFY_REFRESH_SEC:
+                    continue
             x1, y1, x2, y2 = [int(v) for v in inst["bbox_frame"]]
             x1, y1 = max(x1, 0), max(y1, 0)
             x2, y2 = min(x2, w), min(y2, h)
@@ -195,7 +205,7 @@ def classify_loop():
                 res = classifier.classify(
                     crop, x2 - x1, y2 - y1,
                     length_px=inst.get("length_px_frame"),
-                    tip_crops=inst.get("tip_crops"),   # None in realtime path
+                    tip_crops=None,
                     length_cm=inst.get("length_cm"),
                 )
                 # unsure first pass (small gap on a same-length pair) -> run
@@ -218,10 +228,14 @@ def classify_loop():
             except Exception as e:
                 print(f"[classifier] {e}", flush=True)
                 continue
+            done_this_pass += 1
             with cache_lock:
                 fine_grained_cache[int(tid)] = {
                     "class": res["class"], "confidence": res["confidence"],
                     "length_used": res["length_used"], "ts": now,
+                    # confirmed = confident answer without needing tip TTA
+                    "confirmed": bool(res["confidence"] >= 0.70
+                                      and not res.get("tip_tta_used")),
                 }
         time.sleep(0.05)
 
