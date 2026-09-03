@@ -47,6 +47,7 @@ def export_all(ckpt: str, out_dir: str = "onnx_export", opset: int = 17) -> str:
     dummy_len = torch.zeros(1, dtype=torch.float32)
 
     onnx_path = os.path.join(out_dir, "surgical_dino_fusion.onnx")
+    # FIXED batch=1 (no dynamic axes) — faster on ARM/Pi runtimes
     torch.onnx.export(
         model,
         (dummy_px, dummy_len),
@@ -54,11 +55,7 @@ def export_all(ckpt: str, out_dir: str = "onnx_export", opset: int = 17) -> str:
         input_names=["pixel_values", "length_feat"],
         output_names=["embedding"],
         opset_version=opset,
-        dynamic_axes={
-            "pixel_values": {0: "batch"},
-            "length_feat": {0: "batch"},
-            "embedding": {0: "batch"},
-        },
+        do_constant_folding=True,
     )
     print(f"      saved -> {onnx_path}")
 

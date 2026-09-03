@@ -88,8 +88,13 @@ def export_int8(fp32_path: str, out_dir: str, data_dir: str = "dataset") -> str:
 
 
 def export_all(ckpt_path: str, out_dir: str, opset: int = 17,
-               int8: bool = True, data_dir: str = "dataset") -> str:
-    """Callable export (used by train_all.py --export) — returns onnx path."""
+               int8: bool = False, data_dir: str = "dataset") -> str:
+    """Callable export (used by train_all.py --export) — returns onnx path.
+
+    int8 is OFF by default: QDQ static quantization collapses this ViT
+    graph (fg logits 18.6 -> 5.7, all instances lost). Use 448 input for
+    speed instead — that path is verified safe.
+    """
     args = argparse.Namespace(ckpt=ckpt_path, out_dir=out_dir, opset=opset)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -107,6 +112,8 @@ def export_all(ckpt_path: str, out_dir: str, opset: int = 17,
     model.eval()
     dummy = torch.randn(1, 3, cfg.img_size, cfg.img_size, dtype=torch.float32)
     onnx_path = os.path.join(args.out_dir, "detector_dino.onnx")
+    # FIXED batch=1 shape (no dynamic axes): measurably faster on ARM/Pi —
+    # the runtime can fully specialize memory plans + fold shapes
     torch.onnx.export(
         model,
         (dummy,),
@@ -114,7 +121,7 @@ def export_all(ckpt_path: str, out_dir: str, opset: int = 17,
         input_names=["pixel_values"],
         output_names=["logits"],
         opset_version=args.opset,
-        dynamic_axes={"pixel_values": {0: "batch"}, "logits": {0: "batch"}},
+        do_constant_folding=True,
     )
     print(f"      saved -> {onnx_path}")
 
@@ -150,9 +157,11 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out_dir", default="pi_final_v3/onnx_export")
     ap.add_argument("--opset", type=int, default=17)
-    ap.add_argument("--no_int8", action="store_true", help="skip INT8 quantization")
+    ap.add_argument("--int8", action="store_true",
+                    help="INT8 static quant (experimental — FAILED quality gate "
+                         "on this ViT graph, kept only for experiments)")
     args = ap.parse_args()
-    export_all(args.ckpt, args.out_dir, args.opset, int8=not args.no_int8)
+    export_all(args.ckpt, args.out_dir, args.opset, int8=args.int8)
     print("\nDone — copy the whole folder to the Pi (pi_final_v3/onnx_export).")
 
 

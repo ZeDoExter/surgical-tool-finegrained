@@ -65,11 +65,13 @@ class DinoClassifierONNX:
         W = np.load(os.path.join(onnx_dir, "arcface_W.npy"))
         self.W_norm = W / (np.linalg.norm(W, axis=0, keepdims=True) + 1e-8)
 
-        # prefer INT8 if present (see export_to_onnx.py --int8)
-        candidates = ["surgical_dino_fusion_int8.onnx", "surgical_dino_fusion.onnx"]
+        # fp32 only — INT8 quantization of this ViT graph failed quality
+        # checks (see export_detector_onnx notes); "int8" file would be
+        # auto-picked only if you quantized it yourself and verified it
+        candidates = ["surgical_dino_fusion.onnx", "surgical_dino_fusion_int8.onnx"]
         onnx_name = next((n for n in candidates
                           if os.path.exists(os.path.join(onnx_dir, n))), candidates[-1])
-        self.backend = "int8" if "int8" in onnx_name else "fp32"
+        self.backend = "fp32" if "int8" not in onnx_name else "int8"
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL

@@ -32,30 +32,30 @@ IOU_MATCH = 0.3
 DETECT_THREADS = 3
 CLASSIFY_THREADS = 2
 
-# one fixed color per class (BGR) — much easier to read than all-green boxes
+# one fixed DARK color per class (BGR) — white text reads well on all of
+# them; light colors (yellow/cyan) were unreadable and are gone
 CLASS_COLORS_BGR = [
-    (60, 76, 255),    # Artery_Forceps          red
-    (0, 200, 255),    # Cartridge_Syringe       yellow-orange
-    (255, 80, 0),    # Cotton_Piler            blue
-    (200, 0, 255),    # Dental_Mirror           magenta
-    (0, 255, 255),    # Forceps_23              cyan-yellow
-    (255, 255, 0),    # Forceps_150             light blue
-    (0, 140, 255),    # Needle_Holder           orange
-    (180, 105, 255),  # Root_Elevators          pink
-    (100, 100, 100),  # Root_Tip_Elevator_LR    gray
-    (50, 50, 128),    # Root_Tip_Elevator_Straight maroon
-    (128, 128, 0),    # Root_Tip_Pick           olive
-    (0, 255, 0),      # Scapel_Handle           green
-    (255, 0, 140),    # Suture_Scissors         violet
-    (30, 30, 30),    # Triple_Syringe          dark
+    (0, 0, 180),        # Artery_Forceps            dark red
+    (20, 140, 180),      # Cartridge_Syringe         amber
+    (180, 60, 0),        # Cotton_Piler              navy
+    (160, 0, 160),       # Dental_Mirror             dark magenta
+    (130, 130, 0),       # Forceps_23                dark teal
+    (200, 70, 30),       # Forceps_150               dark blue
+    (0, 110, 220),       # Needle_Holder             orange
+    (120, 60, 200),      # Root_Elevators            dark pink
+    (90, 90, 90),        # Root_Tip_Elevator_LR     dark gray
+    (40, 20, 130),       # Root_Tip_Elevator_Straight maroon
+    (30, 110, 110),      # Root_Tip_Pick             olive
+    (60, 140, 0),        # Scapel_Handle             dark green
+    (180, 30, 110),      # Suture_Scissors           dark violet
+    (130, 90, 70),       # Triple_Syringe            dark slate
 ]
-UNKNOWN_COLOR_BGR = (0, 255, 0)
+UNKNOWN_COLOR_BGR = (0, 0, 180)
 
 def class_color(cls_name: str):
     try:
         idx = detector.classes.index(cls_name)
-        c = CLASS_COLORS_BGR[idx]
-        return c if c != (30, 30, 30) else UNKNOWN_COLOR_BGR
+        return CLASS_COLORS_BGR[idx] if idx < len(CLASS_COLORS_BGR) else UNKNOWN_COLOR_BGR
     except (ValueError, AttributeError):
         return UNKNOWN_COLOR_BGR
 
@@ -275,21 +275,8 @@ def camera_loop():
             fps = fps_counter
             fps_counter = 0
             fps_start = time.time()
-        det_ms = getattr(detector, "last_ms", 0)
-        hud = f"FPS:{fps} det:{det_ms:.0f}ms[{detector.backend}]"
-        cv2.putText(annotated, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        # color legend (top-right, compact) — drawn once per frame, tiny cost
-        lx = annotated.shape[1] - 8
-        for cidx in range(len(detector.classes)):
-            cname = detector.classes[cidx]
-            color = CLASS_COLORS_BGR[cidx] if cidx < len(CLASS_COLORS_BGR) else UNKNOWN_COLOR_BGR
-            if color == (30, 30, 30):
-                color = UNKNOWN_COLOR_BGR
-            (tw, th), _ = cv2.getTextSize(cname, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-            cv2.rectangle(annotated, (lx - tw - 14, 10 + cidx * 16),
-                          (lx - tw - 4, 20 + cidx * 16), color, -1)
-            cv2.putText(annotated, cname, (lx - tw, 20 + cidx * 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+        cv2.putText(annotated, f"FPS: {fps}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         with frame_lock:
             output_frame = annotated.copy()
 

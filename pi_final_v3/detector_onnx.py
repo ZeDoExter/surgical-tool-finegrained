@@ -33,14 +33,12 @@ class DinoDetectorONNX:
         self.calibration_ratio = self.meta.get("calibration_ratio")
         self.real_length_cm = self.meta.get("real_length_cm", {})
 
-        # fp32 first, INT8 if exported (see export_detector_onnx.py --int8)
-        candidates = []
-        if prefer_int8:
-            candidates.append("detector_dino_int8.onnx")
-        candidates.append("detector_dino.onnx")
+        # fp32 first — INT8 quantization broke this ViT graph in tests
+        # (kept selectable only if you quantized + verified one yourself)
+        candidates = ["detector_dino.onnx", "detector_dino_int8.onnx"]
         onnx_name = next((n for n in candidates
                           if os.path.exists(os.path.join(onnx_dir, n))), candidates[-1])
-        self.backend = "int8" if "int8" in onnx_name else "fp32"
+        self.backend = "fp32" if "int8" not in onnx_name else "int8"
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -62,18 +60,21 @@ class DinoDetectorONNX:
         frame_bgr: camera frame (any size; internally resized to img_size)
         -> instances (bbox in FRAME coords, mask at model scale, length, tips).
         """
-        t0 = __import__("time").perf_counter()
+        t0 = time.perf_counter()
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        px = pp.preprocess_frame(rgb, self.img_size, rgb_input=True)
+        # resize ONCE, reuse for both the model input and tip-crop space
+        rgb_model = cv2.resize(rgb, (self.img_size, self.img_size))
+        px = (rgb_model.astype(np.float32) / 255.0)
+        px = (px - pp.IMAGENET_MEAN) / pp.IMAGENET_STD
+        px = np.ascontiguousarray(px.transpose(2, 0, 1)[None], dtype=np.float32)
         (logits,) = self.session.run(["logits"], {"pixel_values": px})
         logits = logits[0]  # (1+C, h, w)
         sx, sy = W / logits.shape[2], H / logits.shape[1]
 
-        rgb560 = cv2.resize(rgb, (self.img_size, self.img_size))
         insts = pp.instances_from_logits(
             logits, self.classes,
-            frame_rgb=rgb560,
+            frame_rgb=rgb_model,
             mask_threshold=self.mask_threshold,
             min_instance_area=self.min_instance_area,
             nms_iou=self.nms_iou,
