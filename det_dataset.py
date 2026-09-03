@@ -316,9 +316,13 @@ class DetectorSynthDataset(Dataset):
 
         target = make_grid_targets(instances, self.h, self.w, self.grid, self.num_classes)
 
-        # to tensors (ImageNet norm, CHW)
-        img_f = img.astype(np.float32) / 255.0
-        img_f = (img_f - IMAGENET_MEAN) / IMAGENET_STD
-        image = torch.from_numpy(np.ascontiguousarray(img_f.transpose(2, 0, 1)))
+        # to tensors (ImageNet norm, CHW) — keep float32: IMAGENET stats are
+        # plain tuples, and (float32 - tuple) would silently promote to float64
+        img_f = img.astype(np.float32) / np.float32(255.0)
+        _m = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+        _s = np.asarray(IMAGENET_STD, dtype=np.float32)
+        img_f = (img_f - _m) / _s
+        image = torch.from_numpy(np.ascontiguousarray(img_f.transpose(2, 0, 1),
+                                                      dtype=np.float32))
         target_t = torch.from_numpy(np.ascontiguousarray(target))
         return {"image": image, "target": target_t, "n_instances": len(instances)}

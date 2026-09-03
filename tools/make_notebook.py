@@ -27,6 +27,8 @@ MODULES = [
     "export_detector_onnx.py",
     "calibrate.py",
     "train_all.py",
+    "build_prototypes.py",
+    "train_student.py",
 ]
 
 
@@ -332,7 +334,9 @@ elif vram_gb >= 7:  bs_det, bs_cls = 12, 16
 elif vram_gb >= 3:  bs_det, bs_cls = 6, 8
 else:               bs_det, bs_cls = 2, 4
 
-WORKERS = 2 if IN_COLAB else 0
+# Windows kernels hang with spawn workers; Linux/WSL/Colab want 2
+import platform as _plat
+WORKERS = 0 if _plat.system() == "Windows" else 2
 
 cmd = [
     sys.executable, "-u", "train_all.py",
@@ -413,9 +417,37 @@ det_ckpt = det_cands[0]
 import export_to_onnx as _ec
 import export_detector_onnx as _ed
 _ec.export_all(best_ckpt, "onnx_export")
-_ed.export_all(det_ckpt, "onnx_export")
+# with_tokens=True: extra patch_tokens output → zero-cost prototype labels on Pi
+_ed.export_all(det_ckpt, "onnx_export", with_tokens=True)
+
+import build_prototypes as _bp
+_bp.main(["--ckpt", det_ckpt, "--data_dir", DATA_DIR, "--out_dir", "onnx_export"])
 
 print("onnx_export contents:", os.listdir("onnx_export"))
+'''))
+
+cells.append(md("""## 10b) (Recommended for Pi realtime) Train the tiny student
+
+Distills the DINOv2 detector into LRASPP-MobileNetV3 (~3.2M params) at 320px.
+Verified locally: **15ms vs 705ms per frame (47x)** for the same contract
+(bbox+label via identical post-processing). The DINOv2 detector stays as
+teacher/fallback; the Pi prefers the student file automatically.
+Takes ~1-2h on T4.
+"""))
+cells.append(code('''import glob, os
+tcands = sorted(glob.glob(os.path.join(os.getcwd(), "outputs_detector", "best_detector.pt")))
+if not tcands:
+    raise FileNotFoundError("train the detector first (cell 6)")
+teacher_ckpt = tcands[0]
+
+from train_student import run_training as run_student, export_all_student
+from config import DetectorConfig
+scfg = DetectorConfig(data_dir=DATA_DIR)
+stud_ckpt = run_student(scfg, teacher_ckpt, img_size=320, epochs=40,
+                        batch_size=16, num_workers=2,
+                        output_dir="outputs_student")
+export_all_student(stud_ckpt, "onnx_export", img_size=320, int8=False)
+print("student onnx ready — Pi will auto-prefer detector_dino_student.onnx")
 '''))
 
 cells.append(md("## 11) Download checkpoints + ONNX"))

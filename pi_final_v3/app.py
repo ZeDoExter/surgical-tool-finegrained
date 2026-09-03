@@ -19,6 +19,7 @@ from flask_cors import CORS
 
 from detector_onnx import DinoDetectorONNX
 from dino_classifier_onnx import DinoClassifierONNX
+from fast_classifier import FastClassifier
 
 API_KEY = "e5bdb16ce0552c091383244b3c814ffe51bd15fa73e0bc6f4dc7b09afe00a6a67d2bcc02d3ec3accceec4357b05d275a4cc5e98667b47cae0c154fc55c864f13"
 DETECT_DIR = "onnx_export"
@@ -28,6 +29,8 @@ STICKY_CONFIRMED_SEC = 60.0     # once a track is answered CONFIDENTLY, stop
                                 # re-asking the classifier for a minute — tools
                                 # don't change identity on a table
 CLASSIFY_MAX_PER_PASS = 2      # budget per loop pass — never starve the detector
+FAST_MODE = True               # zero-cost prototype labels first; the slow
+                               # ArcFace classifier only refines unsure tracks
 IOU_MATCH = 0.3
 
 # CPU budget on Pi 5 (4 cores): detector gets the most (it gates the visual
@@ -73,6 +76,13 @@ print(f"[detector] classes {detector.classes} backend={detector.backend} "
 print("[classifier] loading ONNX ...", flush=True)
 classifier = DinoClassifierONNX(CLASSIFY_DIR, num_threads=CLASSIFY_THREADS)
 print(f"[classifier] loaded backend={classifier.backend}", flush=True)
+fast_clf = None
+try:
+    fast_clf = FastClassifier(DETECT_DIR)
+    print(f"[fast] prototypes loaded ({fast_clf.P.shape[1]} classes) — "
+          "zero-cost labels, ArcFace as fallback", flush=True)
+except Exception as e:
+    print(f"[fast] prototypes unavailable ({e}) — ArcFace for everything", flush=True)
 
 
 class IoUTracker:
@@ -124,6 +134,7 @@ last_detection_time = 0
 output_frame = None
 latest_raw_frame = None
 last_instances = []
+last_tokens = None   # patch tokens paired with last_instances (same detect pass)
 fine_grained_cache = {}
 frame_lock = threading.Lock()
 detect_lock = threading.Lock()
@@ -132,7 +143,7 @@ cache_lock = threading.Lock()
 
 
 def detect_loop():
-    global last_instances, latest_detections, last_detection_time
+    global last_instances, latest_detections, last_detection_time, last_tokens
     while True:
         frame = None
         with raw_lock:
@@ -157,6 +168,7 @@ def detect_loop():
             counts[n] = counts.get(n, 0) + 1
         with detect_lock:
             last_instances = insts
+            last_tokens = detector.last_tokens  # paired with these instances
             latest_detections = counts
             last_detection_time = time.time()
 
@@ -166,11 +178,13 @@ def classify_loop():
     while True:
         frame = None
         insts = None
+        toks = None
         with raw_lock:
             if latest_raw_frame is not None:
                 frame = latest_raw_frame.copy()
         with detect_lock:
             insts = list(last_instances)
+            toks = last_tokens
         if frame is None or not insts:
             time.sleep(0.2)
             continue
@@ -195,6 +209,28 @@ def classify_loop():
                 # low-confidence answers retry at the normal cadence
                 if (now - cached["ts"]) < CLASSIFY_REFRESH_SEC:
                     continue
+            # ---- FAST PATH: zero-cost prototype label from the SAME forward
+            # the detector already ran (mask-pool its patch tokens). The slow
+            # ArcFace model only runs when this path is unsure.
+            fast_res = None
+            if FAST_MODE and fast_clf is not None and toks is not None:
+                try:
+                    emb = detector.pool_tokens(inst.get("mask"), toks)
+                    if emb is not None:
+                        fast_res = fast_clf.predict(
+                            emb, length_cm=inst.get("length_cm"))
+                except Exception:
+                    fast_res = None
+            if fast_res is not None and not fast_res["need_refine"]:
+                with cache_lock:
+                    fine_grained_cache[int(tid)] = {
+                        "class": fast_res["class"],
+                        "confidence": fast_res["confidence"],
+                        "length_used": 0.0, "ts": now,
+                        "confirmed": bool(fast_res["confidence"] >= 0.70),
+                        "via": "fast",
+                    }
+                continue  # no ViT forward spent at all
             x1, y1, x2, y2 = [int(v) for v in inst["bbox_frame"]]
             x1, y1 = max(x1, 0), max(y1, 0)
             x2, y2 = min(x2, w), min(y2, h)
@@ -236,6 +272,7 @@ def classify_loop():
                     # confirmed = confident answer without needing tip TTA
                     "confirmed": bool(res["confidence"] >= 0.70
                                       and not res.get("tip_tta_used")),
+                    "via": "arcface",
                 }
         time.sleep(0.05)
 

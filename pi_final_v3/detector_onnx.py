@@ -22,7 +22,7 @@ import det_postprocess as pp
 
 class DinoDetectorONNX:
     def __init__(self, onnx_dir: str = "onnx_export", num_threads: Optional[int] = 3,
-                 prefer_int8: bool = True):
+                 prefer_int8: bool = True, model_file: Optional[str] = None):
         with open(os.path.join(onnx_dir, "detector_meta.json"), "r", encoding="utf-8") as f:
             self.meta = json.load(f)
         self.classes: List[str] = self.meta["classes"]
@@ -33,13 +33,26 @@ class DinoDetectorONNX:
         self.conf_min_score: float = self.meta.get("conf_min_score", 0.35)
         self.calibration_ratio = self.meta.get("calibration_ratio")
         self.real_length_cm = self.meta.get("real_length_cm", {})
+        # patch-token fast path (DINOv2 exports only; the tiny CNN student
+        # has no tokens — fast labels then come from its own coarse output)
+        self.has_tokens: bool = bool(self.meta.get("has_patch_tokens", False))
+        self.token_grid: int = int(self.meta.get("token_grid", self.img_size // 14))
+        self.patch_dim: int = int(self.meta.get("patch_dim", 384))
+        self.last_tokens = None  # (patch_dim, G, G) of the latest frame
 
         # fp32 first — INT8 quantization broke this ViT graph in tests
         # (kept selectable only if you quantized + verified one yourself)
-        candidates = ["detector_dino.onnx", "detector_dino_int8.onnx"]
+        if model_file is None:
+            # student CNN first (realtime), DINOv2 as fallback
+            candidates = ["detector_dino_student.onnx",
+                          "detector_dino.onnx", "detector_dino_int8.onnx"]
+        else:
+            candidates = [model_file]
         onnx_name = next((n for n in candidates
                           if os.path.exists(os.path.join(onnx_dir, n))), candidates[-1])
+        self.model_file = onnx_name
         self.backend = "fp32" if "int8" not in onnx_name else "int8"
+        self.is_student = "student" in onnx_name
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -69,9 +82,16 @@ class DinoDetectorONNX:
         px = (rgb_model.astype(np.float32) / 255.0)
         px = (px - pp.IMAGENET_MEAN) / pp.IMAGENET_STD
         px = np.ascontiguousarray(px.transpose(2, 0, 1)[None], dtype=np.float32)
-        (logits,) = self.session.run(["logits"], {"pixel_values": px})
-        logits = logits[0]  # (1+C, h, w)
+        want_toks = self.has_tokens and not self.is_student
+        out_names = ["logits", "patch_tokens"] if want_toks else ["logits"]
+        outs = self.session.run(out_names, {"pixel_values": px})
+        logits = outs[0][0]  # (1+C, h, w)
         sx, sy = W / logits.shape[2], H / logits.shape[1]
+
+        # zero-cost backbone tokens for the prototype fast path (DINOv2 only)
+        self.last_tokens = None
+        if want_toks and len(outs) > 1:
+            self.last_tokens = outs[1][0].astype(np.float32)  # (384, G, G)
 
         insts = pp.instances_from_logits(
             logits, self.classes,
@@ -90,6 +110,28 @@ class DinoDetectorONNX:
                 inst["length_cm"] = inst["length_px_frame"] * self.calibration_ratio
         self.last_ms = (time.perf_counter() - t0) * 1000.0
         return insts
+
+    def pool_tokens(self, mask: np.ndarray, tokens: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """
+        Mean-pool backbone patch tokens over an instance mask.
+
+        mask: (Hm, Wm) at model scale -> downsampled to the token grid,
+        cells with any FG counted. tokens: (D, G, G) or None (= latest).
+        Returns L2-normalized (patch_dim,) or None.
+        Runtime cost is ~1ms — this is the "free" embedding the prototype
+        fast path classifies with (no 2nd ViT forward).
+        """
+        toks = tokens if tokens is not None else self.last_tokens
+        if toks is None:
+            return None
+        D, G, _ = toks.shape
+        small = cv2.resize((mask > 0).astype(np.uint8), (G, G),
+                           interpolation=cv2.INTER_NEAREST) > 0
+        if int(small.sum()) < 2:
+            return None
+        v = toks[:, small].mean(axis=1).astype(np.float64)
+        n = float(np.linalg.norm(v))
+        return (v / (n + 1e-8)).astype(np.float32)
 
     def draw(self, frame_bgr: np.ndarray, instances: List[dict],
              fine: Optional[dict] = None) -> np.ndarray:

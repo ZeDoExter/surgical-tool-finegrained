@@ -120,6 +120,23 @@ Pi:        pi_final_v3/ — ONNX Runtime, 3 threads (camera/detect/classify),
            # workers MUST be 1 (one camera), no --preload (threads die on fork)
 ```
 
+### Realtime options (fastest last)
+
+1. **448 detector** (no retrain): `--img_size 448 --with_tokens` at export —
+   1.8x faster, same accuracy (40/68 vs 39/68). Thresholds auto-scaled.
+2. **Prototype fast path** (no 2nd model): `build_prototypes.py` centroids;
+   mask-pool backbone tokens + cosine → instant label, 82-86% alone.
+   Confused tracks cascade to the ArcFace classifier (sticky cache).
+   Removes the 93MB classifier forward from ~60% of tracks.
+3. **Student CNN** (`train_student.py`): LRASPP-MobileNetV3 distilled from
+   the detector, 320px, same output contract → **15ms vs 705ms (47x)**.
+   Pi prefers `detector_dino_student.onnx` automatically when present.
+   Coarse labels come free from the student; ArcFace refines hard cases.
+
+INT8 on this ViT graph is OFF (QDQ collapses fg logits even after constant
+folding + real-photo calibration: agreement 0/68). fp32 + 448/tokens/student
+is the verified path.
+
 ---
 
 ## 4) Default Config (from experiments)

@@ -15,7 +15,6 @@ Stages:
 """
 import argparse
 import time
-from dataclasses import replace
 
 
 def _fmt(sec: float) -> str:
@@ -36,13 +35,21 @@ def main() -> None:
                          "must be divisible by 14)")
     ap.add_argument("--img_size_cls", type=int, default=560,
                     help="classifier input (keep 560 — tip detail matters)")
-    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--num_workers", type=int, default=None,
+                    help="default: 2 on Linux/WSL/Colab, 0 on Windows "
+                         "(spawn-in-notebook hangs there)")
     ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default="lora")
     ap.add_argument("--skip_detector", action="store_true", help="train classifier only")
     ap.add_argument("--skip_classifier", action="store_true", help="train detector only")
     ap.add_argument("--export", action="store_true", help="export ONNX after training")
+    ap.add_argument("--det_tokens", action="store_true",
+                    help="export detector with patch tokens + build class "
+                         "prototypes (zero-cost fast path on the Pi)")
     args = ap.parse_args()
 
+    if args.num_workers is None:
+        import platform
+        args.num_workers = 0 if platform.system() == "Windows" else 2
     t0 = time.time()
 
     det_ckpt = None
@@ -81,7 +88,12 @@ def main() -> None:
         import export_detector_onnx as _ed
         import export_to_onnx as _ec
         if det_ckpt:
-            _ed.export_all(det_ckpt, "pi_final_v3/onnx_export")
+            _ed.export_all(det_ckpt, "pi_final_v3/onnx_export",
+                           with_tokens=args.det_tokens)
+            if args.det_tokens:
+                import build_prototypes as _bp
+                _bp.main(["--ckpt", det_ckpt, "--data_dir", args.data_dir,
+                          "--out_dir", "pi_final_v3/onnx_export"])
         if cls_ckpt:
             _ec.export_all(cls_ckpt, "pi_final_v3/onnx_export")
 
