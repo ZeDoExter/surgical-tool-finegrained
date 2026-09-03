@@ -10,6 +10,7 @@ v3.1 realtime optimizations:
 """
 import json
 import os
+import time
 from typing import List, Optional
 
 import cv2
@@ -87,7 +88,7 @@ class DinoDetectorONNX:
             inst["length_px_frame"] = inst["length_px"] * max(sx, sy)
             if self.calibration_ratio:
                 inst["length_cm"] = inst["length_px_frame"] * self.calibration_ratio
-        self.last_ms = (__import__("time").perf_counter() - t0) * 1000.0
+        self.last_ms = (time.perf_counter() - t0) * 1000.0
         return insts
 
     def draw(self, frame_bgr: np.ndarray, instances: List[dict],
