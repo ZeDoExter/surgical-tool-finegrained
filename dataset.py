@@ -144,6 +144,10 @@ def load_coco_records(data_dir: str, split: str,
             "label": name_to_label[cname],
             "coco_json": ann_path,
         })
+    # v3 reality fix: same tool annotated as multiple touching polygons
+    # (e.g. Cotton_Piler jaws) -> merge into ONE record, else the detector
+    # learns "each tooth = one instrument" and answers 1 tool as N boxes
+    records = merge_split_annotations(records)
     return records, class_names
 
 
@@ -497,6 +501,110 @@ def maybe_tip_zoom(img: np.ndarray, mask: Optional[np.ndarray], prob: float,
         return img
 
 
+def rotate_image_mask(img: np.ndarray, mask: Optional[np.ndarray],
+                      angle_deg: float, border_value: int = 0) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Rotate image (and its mask, if given) together around the mask centroid
+    with expanded bounding box — nothing is cut off.
+
+    Why: the classifier training only saw axis-aligned crops + flips, so the
+    live camera mixing up tools at rotated angles was expected. Rotating
+    image+mask together keeps the instrument and its length feature intact.
+    Length is recomputed AFTER rotation by the caller (minAreaRect is
+    rotation-invariant anyway).
+    """
+    h, w = img.shape[:2]
+    if mask is not None and mask.shape[0] == h and mask.shape[1] == w:
+        cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            M0 = cv2.moments(max(cnts, key=cv2.contourArea))
+            if M0["m00"] > 0:
+                center = (M0["m10"] / M0["m00"], M0["m01"] / M0["m00"])
+            else:
+                center = (w / 2, h / 2)
+        else:
+            center = (w / 2, h / 2)
+    else:
+        center = (w / 2, h / 2)
+
+    # expanded canvas so nothing is clipped
+    cos_a, sin_a = abs(math.cos(math.radians(angle_deg))), abs(math.sin(math.radians(angle_deg)))
+    new_w = int(w * cos_a + h * sin_a) + 1
+    new_h = int(w * sin_a + h * cos_a) + 1
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    M[0, 2] += new_w / 2 - center[0]
+    M[1, 2] += new_h / 2 - center[1]
+    # pad source to new canvas first so warp doesn't sample outside
+    pw, ph = max(new_w - w, 0), max(new_h - h, 0)
+    img_p = cv2.copyMakeBorder(img, ph // 2, ph - ph // 2, pw // 2, pw - pw // 2,
+                               cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    if mask is not None:
+        mask_p = cv2.copyMakeBorder(mask, ph // 2, ph - ph // 2, pw // 2, pw - pw // 2,
+                                    cv2.BORDER_CONSTANT, value=0)
+    else:
+        mask_p = None
+    # recompute center on padded coords
+    center_p = (center[0] + pw // 2, center[1] + ph // 2)
+    M = cv2.getRotationMatrix2D(center_p, angle_deg, 1.0)
+    rot_h, rot_w = img_p.shape[:2]
+    img_r = cv2.warpAffine(img_p, M, (rot_w, rot_h), flags=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    mask_r = None
+    if mask_p is not None:
+        mask_r = cv2.warpAffine(mask_p, M, (rot_w, rot_h), flags=cv2.INTER_NEAREST,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return img_r, mask_r
+
+
+def merge_split_annotations(records: List[dict], min_contact_px: int = 8) -> List[dict]:
+    """
+    v3 reality: one physical tool is sometimes annotated as MULTIPLE polygons
+    (e.g. Cotton_Piler jaws labeled as 2 separate "teeth" polygons). The
+    detector then learns "each tooth = one instrument" and the live feed
+    answers 1 tool as 3 boxes.
+
+    Fix at the SOURCE: merge records of the same class on the same image
+    whose masks touch/overlap (dilated by min_contact_px) into ONE record
+    with concatenated polygons — a merged mask gives the correct length via
+    minAreaRect and one bbox for cropping.
+    """
+    from collections import defaultdict
+    by_img = defaultdict(list)
+    for r in records:
+        by_img[r["image_path"]].append(r)
+    out: List[dict] = []
+    for path, rs in by_img.items():
+        used = [False] * len(rs)
+        for i, r in enumerate(rs):
+            if used[i]:
+                continue
+            group = [r]
+            used[i] = True
+            m_i = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
+            for j in range(i + 1, len(rs)):
+                if used[j] or rs[j]["class_name"] != r["class_name"]:
+                    continue
+                m_j = mask_from_coco_segmentation(rs[j]["segmentation"], rs[j]["height"], rs[j]["width"])
+                k = np.ones((min_contact_px * 2 + 1, min_contact_px * 2 + 1), np.uint8)
+                near = cv2.dilate(m_i, k) > 0
+                if np.any(near & (m_j > 0)):
+                    group.append(rs[j])
+                    used[j] = True
+                    m_i = np.maximum(m_i, m_j)
+            if len(group) == 1:
+                out.append(r)
+            else:
+                merged_seg = []
+                for g in group:
+                    if isinstance(g["segmentation"], list):
+                        merged_seg.extend(g["segmentation"])
+                base = dict(group[0])
+                base["segmentation"] = merged_seg
+                out.append(base)
+    return out
+
+
 def build_photometric_aug() -> A.Compose:
     """
     Photometric augmentation for training — intentionally stronger than usual
@@ -612,7 +720,9 @@ class SurgicalInstrumentDataset(Dataset):
                  patch_paste_prob: float = 0.0, patch_paste_max_objects: int = 2,
                  patch_paste_max_overlap: float = 0.20,
                  tip_zoom_prob: float = 0.0, tip_zoom_size: float = 0.42,
-                 coco_json: Optional[str] = None):
+                 coco_json: Optional[str] = None,
+                 rotate_prob: float = 0.5, rotate_range: Tuple[float, float] = (-180.0, 180.0),
+                 hard_classes: Optional[List[str]] = None, hard_tip_zoom_prob: float = 0.7):
         self.records = records
         self.length_mean, self.length_std = length_stats
         self.training = training
@@ -626,6 +736,19 @@ class SurgicalInstrumentDataset(Dataset):
         self.tip_zoom_prob = tip_zoom_prob if training else 0.0
         self.tip_zoom_size = tip_zoom_size
         self.coco_json = coco_json
+        self.rotate_prob = rotate_prob if training else 0.0
+        self.rotate_range = rotate_range
+        from config import HARD_CLASSES
+        self.hard_classes = set(hard_classes if hard_classes is not None else HARD_CLASSES)
+        self.hard_tip_zoom_prob = hard_tip_zoom_prob
+        # oversample hard classes x3: repeat their records in the index pool
+        if training:
+            base = list(range(len(self.records)))
+            extra = [i for i, r in enumerate(self.records)
+                     if r["class_name"] in self.hard_classes] * 2
+            self._index_pool = base + extra
+        else:
+            self._index_pool = list(range(len(self.records)))
         self.tensor_tf = build_tensor_transform(img_size)
         self.aug = build_photometric_aug() if training else None
         self.flip_flags = flip_flags
@@ -642,7 +765,14 @@ class SurgicalInstrumentDataset(Dataset):
                     self._patch_pool.append(p)
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self._index_pool)
+
+    @staticmethod
+    def _mask_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return 0, 0, mask.shape[1], mask.shape[0]
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
     def _maybe_crop(self, img: np.ndarray, r: dict) -> np.ndarray:
         m = self.bbox_margin
@@ -653,7 +783,7 @@ class SurgicalInstrumentDataset(Dataset):
         return img[y1:y2, x1:x2]
 
     def __getitem__(self, idx: int) -> dict:
-        r = self.records[idx]
+        r = self.records[self._index_pool[idx]]
         img = cv2.imread(r["image_path"], cv2.IMREAD_COLOR)
         if img is None:
             raise IOError(f"Failed to read image: {r['image_path']}")
@@ -661,6 +791,20 @@ class SurgicalInstrumentDataset(Dataset):
 
         if self.training:
             target_mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])
+            # ROTATION: live camera sees tools at any angle — train on it.
+            # Crop FIRST (small canvas), THEN rotate image+mask together so the
+            # rotated canvas stays small. minAreaRect length is
+            # rotation-invariant so the length feature stays correct.
+            x1, y1, x2, y2 = self._mask_bbox(target_mask)
+            m = self.bbox_margin
+            dx, dy = int((x2 - x1) * m), int((y2 - y1) * m)
+            cx1, cy1 = max(x1 - dx, 0), max(y1 - dy, 0)
+            cx2, cy2 = min(x2 + dx, r["width"]), min(y2 + dy, r["height"])
+            img = img[cy1:cy2, cx1:cx2]
+            target_mask = target_mask[cy1:cy2, cx1:cx2].copy()
+            if self.rotate_prob > 0 and random.random() < self.rotate_prob:
+                angle = random.uniform(*self.rotate_range)
+                img, target_mask = rotate_image_mask(img, target_mask, angle)
             # Mask-Aware Patch-Paste (Copy-Paste): paste secondary tools onto green cloth
             if self.patch_paste_prob > 0 and self._patch_pool and random.random() < self.patch_paste_prob:
                 img = patch_paste_augment(
@@ -671,12 +815,12 @@ class SurgicalInstrumentDataset(Dataset):
                     max_overlap=self.patch_paste_max_overlap,
                     blend_feather=3
                 )
-            # TIP-ZOOM on the FULL image+mask (must run before bbox crop —
-            # otherwise mask coords no longer match the cropped image)
-            if self.tip_zoom_prob > 0 and random.random() < self.tip_zoom_prob:
+            # TIP-ZOOM on the cropped view. Hard classes
+            # (Suture/Artery/Needle) get a much higher rate.
+            tip_p = self.tip_zoom_prob if r["class_name"] not in self.hard_classes \
+                else self.hard_tip_zoom_prob
+            if tip_p > 0 and random.random() < tip_p:
                 img = maybe_tip_zoom(img, target_mask, 1.0, self.tip_zoom_size)
-            elif self.bbox_margin > 0:
-                img = self._maybe_crop(img, r)
             if random.random() < 0.5:               # green-cloth shadow
                 img = simulate_shadow(img)
             img = self.aug(image=img)["image"]
@@ -689,7 +833,7 @@ class SurgicalInstrumentDataset(Dataset):
 
         # main tensor
         tensor = self.tensor_tf(image=img)["image"]
-        length_norm = (self._lengths[idx] - self.length_mean) / self.length_std
+        length_norm = (self._lengths[self._index_pool[idx]] - self.length_mean) / self.length_std
         out = {
             "image": tensor,
             "length": torch.tensor(length_norm, dtype=torch.float32),

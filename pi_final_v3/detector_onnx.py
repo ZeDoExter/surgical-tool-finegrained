@@ -2,26 +2,26 @@
 """
 detector_onnx.py — DINOv2 detector (YOLO-free) on Raspberry Pi 5 via ONNX Runtime
 
-Same post-processing as det_postprocess.py (numpy/cv2 only). One 560×560
-forward per frame → mask + label per instance → bbox + mask length (minAreaRect).
-
-Files needed in onnx_dir:
-    detector_dino.onnx, detector_meta.json
+v3.1 realtime optimizations:
+  - auto-prefers INT8 model if present (detector_dino_int8.onnx) — 2-3x faster
+    on CPU with negligible accuracy loss for this task
+  - thread budget: default 3 threads (leave 1 core for camera/annotate/classifier)
+  - reports last inference time (ms) for the HUD
 """
 import json
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 
-# keep det_postprocess import-free of torch — reuse it directly
 import det_postprocess as pp
 
 
 class DinoDetectorONNX:
-    def __init__(self, onnx_dir: str = "onnx_export", num_threads: Optional[int] = None):
+    def __init__(self, onnx_dir: str = "onnx_export", num_threads: Optional[int] = 3,
+                 prefer_int8: bool = True):
         with open(os.path.join(onnx_dir, "detector_meta.json"), "r", encoding="utf-8") as f:
             self.meta = json.load(f)
         self.classes: List[str] = self.meta["classes"]
@@ -33,45 +33,60 @@ class DinoDetectorONNX:
         self.calibration_ratio = self.meta.get("calibration_ratio")
         self.real_length_cm = self.meta.get("real_length_cm", {})
 
+        # fp32 first, INT8 if exported (see export_detector_onnx.py --int8)
+        candidates = []
+        if prefer_int8:
+            candidates.append("detector_dino_int8.onnx")
+        candidates.append("detector_dino.onnx")
+        onnx_name = next((n for n in candidates
+                          if os.path.exists(os.path.join(onnx_dir, n))), candidates[-1])
+        self.backend = "int8" if "int8" in onnx_name else "fp32"
+
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         if num_threads:
             so.intra_op_num_threads = num_threads
         self.session = ort.InferenceSession(
-            os.path.join(onnx_dir, "detector_dino.onnx"),
+            os.path.join(onnx_dir, onnx_name),
             sess_options=so, providers=["CPUExecutionProvider"])
+
+        # warmup: first inference allocates memory arenas + spins the thread
+        # pool — do it at startup, not on the first real frame
+        dummy = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        self.detect(dummy, want_tip_crops=False)
+        self.last_ms = 0.0
 
     def detect(self, frame_bgr: np.ndarray, want_tip_crops: bool = True) -> List[dict]:
         """
-        frame_bgr: camera frame (any size; internally resized to 560)
-        → list of instances (bbox in FRAME coords, mask at 560 scale,
-          length_px at frame scale, optional tip_crops for the classifier).
+        frame_bgr: camera frame (any size; internally resized to img_size)
+        -> instances (bbox in FRAME coords, mask at model scale, length, tips).
         """
+        t0 = __import__("time").perf_counter()
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         px = pp.preprocess_frame(rgb, self.img_size, rgb_input=True)
         (logits,) = self.session.run(["logits"], {"pixel_values": px})
-        logits = logits[0]  # (1+C, 560, 560)
+        logits = logits[0]  # (1+C, h, w)
         sx, sy = W / logits.shape[2], H / logits.shape[1]
 
         rgb560 = cv2.resize(rgb, (self.img_size, self.img_size))
         insts = pp.instances_from_logits(
             logits, self.classes,
-            frame_rgb=rgb560,           # tip crops at 560-space (enough detail)
+            frame_rgb=rgb560,
             mask_threshold=self.mask_threshold,
             min_instance_area=self.min_instance_area,
             nms_iou=self.nms_iou,
             conf_min_score=self.conf_min_score,
             want_tip_crops=want_tip_crops,
         )
-        # frame-space boxes + length in frame px → cm via calibration
         for inst in insts:
             x1, y1, x2, y2 = inst["bbox"]
             inst["bbox_frame"] = [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
             inst["length_px_frame"] = inst["length_px"] * max(sx, sy)
             if self.calibration_ratio:
                 inst["length_cm"] = inst["length_px_frame"] * self.calibration_ratio
-            # tip crops are at 560-space — fine for the classifier input
+        self.last_ms = (__import__("time").perf_counter() - t0) * 1000.0
         return insts
 
     def draw(self, frame_bgr: np.ndarray, instances: List[dict],

@@ -94,6 +94,14 @@ TIP_CRITICAL_PAIRS: List[List[str]] = [
     ["Mandibular_Universal_Forceps_23", "Maxillary_Universal_Forceps_150"],
 ]
 
+# Confusion-prone classes (from live-camera errors): these get EXTRA
+# augmentation (rotation, tip-zoom, oversampling) during training.
+HARD_CLASSES: List[str] = [
+    "Suture_Scissors",
+    "Artery_Forceps",
+    "Needle_Holder",
+]
+
 
 @dataclass
 class DetectorConfig:

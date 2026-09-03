@@ -65,13 +65,28 @@ class DinoClassifierONNX:
         W = np.load(os.path.join(onnx_dir, "arcface_W.npy"))
         self.W_norm = W / (np.linalg.norm(W, axis=0, keepdims=True) + 1e-8)
 
+        # prefer INT8 if present (see export_to_onnx.py --int8)
+        candidates = ["surgical_dino_fusion_int8.onnx", "surgical_dino_fusion.onnx"]
+        onnx_name = next((n for n in candidates
+                          if os.path.exists(os.path.join(onnx_dir, n))), candidates[-1])
+        self.backend = "int8" if "int8" in onnx_name else "fp32"
+
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         if num_threads:
             so.intra_op_num_threads = num_threads
         self.session = ort.InferenceSession(
-            os.path.join(onnx_dir, "surgical_dino_fusion.onnx"),
+            os.path.join(onnx_dir, onnx_name),
             sess_options=so, providers=["CPUExecutionProvider"])
+
+        # warmup so the first real crop isn't slow (arena allocation + thread pool)
+        dummy = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+        self._embed(dummy, np.zeros(1, dtype=np.float32))
+
+        # cheap first-pass template: skip tip TTA unless the top-2 gap is
+        # small AND lands in a same-length pair (the pairs tip TTA exists for)
+        self.tip_gap_threshold = 0.35   # softmax gap below which tips are consulted
 
     def _preprocess(self, rgb_crop: np.ndarray) -> np.ndarray:
         img = cv2.resize(rgb_crop, (self.img_size, self.img_size)).astype(np.float32) / 255.0
@@ -94,13 +109,18 @@ class DinoClassifierONNX:
     def classify(self, rgb_crop: np.ndarray, box_w: int, box_h: int,
                  length_px: Optional[float] = None,
                  tip_crops: Optional[List[np.ndarray]] = None,
-                 length_cm: Optional[float] = None) -> dict:
+                 length_cm: Optional[float] = None,
+                 force_tip_tta: bool = False) -> dict:
         """
         rgb_crop: RGB crop of one instrument
         box_w, box_h: fallback length if no mask length is given
         length_px: minAreaRect long side from the detector mask (preferred)
         tip_crops: both-end RGB crops from det_postprocess.extract_tip_crops
         length_cm: physical length if calibration_ratio is set
+
+        Realtime path: single forward. Tip TTA (2 extra forwards) only when
+        the top-2 softmax gap is small AND the pair is one of the same-length
+        pairs — that's what tip TTA exists for. force_tip_tta overrides.
         """
         L = float(length_px) if length_px is not None else float(max(box_w, box_h))
         if self.calibration_ratio and length_cm is None:
@@ -113,7 +133,16 @@ class DinoClassifierONNX:
         emb = self._embed(rgb_crop, length_norm)
         probs = self._probs_from_emb(emb)
 
-        if tip_crops:
+        # ---- conditional tip TTA ----
+        order = probs.argsort()[::-1]
+        top1, top2 = self.classes[int(order[0])], self.classes[int(order[1])]
+        gap = float(probs[order[0]] - probs[order[1]])
+        pair = {top1, top2}
+        need_tips = (tip_crops and
+                     (force_tip_tta or
+                      (gap < self.tip_gap_threshold and
+                       any(pair == p for p in TIP_PAIRS))))
+        if need_tips:
             tip_ps = []
             for crop in tip_crops:
                 if crop is None or crop.size < 16:
@@ -124,8 +153,7 @@ class DinoClassifierONNX:
                     continue
             if tip_ps:
                 probs_tip = np.mean(tip_ps, axis=0)
-                top2 = {self.classes[int(i)] for i in np.argsort(probs)[::-1][:2]}
-                w = 2.5 if any(top2 == p for p in TIP_PAIRS) else 1.0
+                w = 2.5 if any(pair == p for p in TIP_PAIRS) else 1.0
                 blended = probs * (probs_tip ** w)
                 probs = blended / blended.sum()
 
@@ -142,4 +170,5 @@ class DinoClassifierONNX:
             "confidence": float(probs[top_idx]),
             "top3": top3,
             "length_used": float(L_feat),
+            "tip_tta_used": bool(need_tips),
         }

@@ -26,15 +26,49 @@ CLASSIFY_DIR = "onnx_export"
 CLASSIFY_REFRESH_SEC = 5.0
 IOU_MATCH = 0.3
 
+# CPU budget on Pi 5 (4 cores): detector gets the most (it gates the visual
+# latency), classifier runs on fewer threads but only when a new track needs
+# labeling. Camera/annotate threads are I/O-bound and need almost no CPU.
+DETECT_THREADS = 3
+CLASSIFY_THREADS = 2
+
+# one fixed color per class (BGR) — much easier to read than all-green boxes
+CLASS_COLORS_BGR = [
+    (60, 76, 255),    # Artery_Forceps          red
+    (0, 200, 255),    # Cartridge_Syringe       yellow-orange
+    (255, 80, 0),    # Cotton_Piler            blue
+    (200, 0, 255),    # Dental_Mirror           magenta
+    (0, 255, 255),    # Forceps_23              cyan-yellow
+    (255, 255, 0),    # Forceps_150             light blue
+    (0, 140, 255),    # Needle_Holder           orange
+    (180, 105, 255),  # Root_Elevators          pink
+    (100, 100, 100),  # Root_Tip_Elevator_LR    gray
+    (50, 50, 128),    # Root_Tip_Elevator_Straight maroon
+    (128, 128, 0),    # Root_Tip_Pick           olive
+    (0, 255, 0),      # Scapel_Handle           green
+    (255, 0, 140),    # Suture_Scissors         violet
+    (30, 30, 30),    # Triple_Syringe          dark
+]
+UNKNOWN_COLOR_BGR = (0, 255, 0)
+
+def class_color(cls_name: str):
+    try:
+        idx = detector.classes.index(cls_name)
+        c = CLASS_COLORS_BGR[idx]
+        return c if c != (30, 30, 30) else UNKNOWN_COLOR_BGR
+    except (ValueError, AttributeError):
+        return UNKNOWN_COLOR_BGR
+
 app = Flask(__name__)
 CORS(app)
 
 print("[detector] loading ONNX ...", flush=True)
-detector = DinoDetectorONNX(DETECT_DIR, num_threads=4)
-print("[detector] classes", detector.classes, flush=True)
+detector = DinoDetectorONNX(DETECT_DIR, num_threads=DETECT_THREADS)
+print(f"[detector] classes {detector.classes} backend={detector.backend} "
+      f"warmup={detector.last_ms:.0f}ms", flush=True)
 print("[classifier] loading ONNX ...", flush=True)
-classifier = DinoClassifierONNX(CLASSIFY_DIR, num_threads=4)
-print("[classifier] loaded", classifier.classes, flush=True)
+classifier = DinoClassifierONNX(CLASSIFY_DIR, num_threads=CLASSIFY_THREADS)
+print(f"[classifier] loaded backend={classifier.backend}", flush=True)
 
 
 class IoUTracker:
@@ -104,7 +138,10 @@ def detect_loop():
             time.sleep(0.01)
             continue
         try:
-            insts = detector.detect(frame, want_tip_crops=True)
+            # realtime path: NO tip crops here (crop extraction costs ~2-4ms
+            # per instance) — the classifier thread cuts tips itself only for
+            # tracks it actually needs to (re)label
+            insts = detector.detect(frame, want_tip_crops=False)
             insts = tracker.update(insts)
         except Exception as e:
             print(f"[detector] {e}", flush=True)
@@ -121,6 +158,7 @@ def detect_loop():
 
 
 def classify_loop():
+    import det_postprocess as pp
     while True:
         frame = None
         insts = None
@@ -134,6 +172,11 @@ def classify_loop():
             continue
         now = time.time()
         h, w = frame.shape[:2]
+        # resize frame once for tip-crop coordinate space (same as detector)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_model = cv2.resize(rgb_frame, (detector.img_size, detector.img_size))
+        sx_m = detector.img_size / w
+        sy_m = detector.img_size / h
         for inst in insts:
             tid = inst.get("track_id")
             if tid is None:
@@ -147,14 +190,31 @@ def classify_loop():
             x2, y2 = min(x2, w), min(y2, h)
             if x2 - x1 < 8 or y2 - y1 < 8:
                 continue
-            crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            crop = rgb_frame[y1:y2, x1:x2]
             try:
                 res = classifier.classify(
                     crop, x2 - x1, y2 - y1,
                     length_px=inst.get("length_px_frame"),
-                    tip_crops=inst.get("tip_crops"),
+                    tip_crops=inst.get("tip_crops"),   # None in realtime path
                     length_cm=inst.get("length_cm"),
                 )
+                # unsure first pass (small gap on a same-length pair) -> run
+                # tip TTA once for this track with freshly-cut tips
+                if (res["confidence"] < 0.55 and inst.get("mask") is not None
+                        and res.get("top3") and len(res["top3"]) > 1):
+                    m = inst["mask"]
+                    if m.shape[:2] != rgb_model.shape[:2]:
+                        m = cv2.resize(m, (detector.img_size, detector.img_size),
+                                       interpolation=cv2.INTER_NEAREST)
+                    tips = pp.extract_tip_crops(rgb_model, m)
+                    if tips:
+                        res = classifier.classify(
+                            crop, x2 - x1, y2 - y1,
+                            length_px=inst.get("length_px_frame"),
+                            tip_crops=tips,
+                            length_cm=inst.get("length_cm"),
+                            force_tip_tta=True,
+                        )
             except Exception as e:
                 print(f"[classifier] {e}", flush=True)
                 continue
@@ -192,19 +252,44 @@ def camera_loop():
                 with cache_lock:
                     fine = fine_grained_cache.get(int(tid))
             x1, y1, x2, y2 = [int(v) for v in inst["bbox_frame"]]
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
             if fine is not None:
-                label = f"{fine['class']} {fine['confidence']:.2f} #{tid}"
+                name, conf = fine["class"], fine["confidence"]
             else:
-                label = f"{inst['class_name']} {inst['score']:.2f} #{tid} (classifying...)"
-            cv2.putText(annotated, label, (x1, max(y1 - 6, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                name, conf = inst["class_name"], inst["score"]
+            color = class_color(name)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            label = f"{name} {conf:.2f}"
+            if tid is not None:
+                label += f" #{tid}"
+            if fine is None:
+                label += " ..."
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(annotated, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            if "length_cm" in inst:
+                cv2.putText(annotated, f"{inst['length_cm']:.1f}cm", (x1 + 2, y2 + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         fps_counter += 1
         if time.time() - fps_start >= 1.0:
             fps = fps_counter
             fps_counter = 0
             fps_start = time.time()
-        cv2.putText(annotated, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        det_ms = getattr(detector, "last_ms", 0)
+        hud = f"FPS:{fps} det:{det_ms:.0f}ms[{detector.backend}]"
+        cv2.putText(annotated, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # color legend (top-right, compact) — drawn once per frame, tiny cost
+        lx = annotated.shape[1] - 8
+        for cidx in range(len(detector.classes)):
+            cname = detector.classes[cidx]
+            color = CLASS_COLORS_BGR[cidx] if cidx < len(CLASS_COLORS_BGR) else UNKNOWN_COLOR_BGR
+            if color == (30, 30, 30):
+                color = UNKNOWN_COLOR_BGR
+            (tw, th), _ = cv2.getTextSize(cname, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+            cv2.rectangle(annotated, (lx - tw - 14, 10 + cidx * 16),
+                          (lx - tw - 4, 20 + cidx * 16), color, -1)
+            cv2.putText(annotated, cname, (lx - tw, 20 + cidx * 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
         with frame_lock:
             output_frame = annotated.copy()
 

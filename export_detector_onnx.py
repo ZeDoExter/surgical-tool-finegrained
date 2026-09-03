@@ -24,7 +24,63 @@ from config import REAL_LENGTH_CM
 from det_model import load_detector
 
 
-def export_all(ckpt_path: str, out_dir: str, opset: int = 17) -> str:
+def export_int8(fp32_path: str, out_dir: str, data_dir: str = "dataset") -> str:
+    """
+    Post-training static INT8 quantization for CPU (Pi 5).
+
+    Calibrates on synthetic scenes from the SAME generator the detector
+    trained on (domain-matched), then writes detector_dino_int8.onnx.
+    Falls back gracefully (returns fp32 path) if quantization deps missing.
+    """
+    try:
+        from onnxruntime.quantization import (CalibrationDataReader, QuantFormat,
+                                              QuantType, quantize_static)
+    except ImportError:
+        print("[int8] onnxruntime.quantization unavailable -> skip")
+        return fp32_path
+
+    # calibration data: 40 synthetic multi-tool scenes through real preprocessing
+    import cv2
+    import numpy as np
+    import random
+    from det_dataset import build_patch_pool, synth_scene
+    from det_postprocess import preprocess_frame
+
+    pool, classes = build_patch_pool(data_dir, min_area=80)
+    rng = random.Random(0)
+
+    class SceneReader(CalibrationDataReader):
+        def __init__(self, n=40):
+            self.i = 0
+            self.n = n
+            self.data = []
+            for _ in range(n):
+                img, _ = synth_scene(pool, 560, 560, rng, min_objects=2, max_objects=4)
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                self.data.append({"pixel_values": preprocess_frame(img_bgr, 560)})
+
+        def get_next(self):
+            if self.i >= self.n:
+                return None
+            item = self.data[self.i]
+            self.i += 1
+            return item
+
+    int8_path = os.path.join(out_dir, "detector_dino_int8.onnx")
+    quantize_static(
+        fp32_path, int8_path,
+        SceneReader(),
+        quant_format=QuantFormat.QDQ,
+        per_channel=True,
+        activation_type=QuantType.QUInt8,
+        weight_type=QuantType.QInt8,
+    )
+    print(f"[int8] saved -> {int8_path}")
+    return int8_path
+
+
+def export_all(ckpt_path: str, out_dir: str, opset: int = 17,
+               int8: bool = True, data_dir: str = "dataset") -> str:
     """Callable export (used by train_all.py --export) — returns onnx path."""
     args = argparse.Namespace(ckpt=ckpt_path, out_dir=out_dir, opset=opset)
 
@@ -75,6 +131,9 @@ def export_all(ckpt_path: str, out_dir: str, opset: int = 17) -> str:
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"      saved -> {meta_path}")
+
+    if int8:
+        export_int8(onnx_path, args.out_dir, data_dir=data_dir)
     return onnx_path
 
 
@@ -83,8 +142,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out_dir", default="pi_final_v3/onnx_export")
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--no_int8", action="store_true", help="skip INT8 quantization")
     args = ap.parse_args()
-    export_all(args.ckpt, args.out_dir, args.opset)
+    export_all(args.ckpt, args.out_dir, args.opset, int8=not args.no_int8)
     print("\nDone — copy the whole folder to the Pi (pi_final_v3/onnx_export).")
 
 

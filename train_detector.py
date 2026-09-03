@@ -352,6 +352,9 @@ def main(argv=None) -> None:
     ap.add_argument("--data_dir", default="dataset")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--img_size", type=int, default=None,
+                    help="560 default; 448 = ~1.7x faster on Pi for realtime "
+                         "(must be divisible by 14; re-export ONNX after training)")
     ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default=None)
     ap.add_argument("--output_dir", default=None)
     ap.add_argument("--num_workers", type=int, default=None)
