@@ -26,6 +26,7 @@ MODULES = [
     "export_to_onnx.py",
     "export_detector_onnx.py",
     "calibrate.py",
+    "train_all.py",
 ]
 
 
@@ -63,51 +64,100 @@ Handled by **tip-zoom augmentation + tip TTA**.
 Length still helps: `Root_Elevators` 15.5 cm vs `Root_Tip_Elevator_Straight` 14.5 cm
 (after `calibrate.py` on the Pi rig).
 
-**Runtime:** Colab T4 GPU. Upload `dataset.zip` (Roboflow COCO Segmentation) first.
+**Runtime (pick one — auto-detected):**
+- **Google Colab** (T4) — upload `dataset.zip` first
+- **Local machine via VS Code** (Colab/notebook extension, own GPU as kernel) —
+  expects `dataset/` in the repo; batch sizes auto-scale to your VRAM,
+  no package upgrades, Windows-safe workers
+
+Upload `dataset.zip` (Roboflow COCO Segmentation) when on Colab.
 """))
 
-cells.append(md("## 0) Install"))
-cells.append(code("""%pip install -q -U torchao peft transformers pytorch-metric-learning albumentations \\
-    opencv-python-headless scikit-learn seaborn tqdm onnxruntime
-print("deps ready")
-"""))
+cells.append(md("## 0) Environment + dependencies"))
+cells.append(code('''import sys, subprocess, importlib.util
 
-cells.append(md("## 1) Dataset — upload `dataset.zip` then run"))
-cells.append(code("""import os, pathlib, zipfile
+# ── detect where we are ─────────────────────────────────────────
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+print("environment:", "Colab (cloud T4)" if IN_COLAB else "LOCAL machine (own GPU)")
 
-found_zip = None
-for zname in [
-    "dataset.zip", "/content/dataset.zip",
-    "Dental Instrument v2.v2i.coco.zip",
-    "/content/Dental Instrument v2.v2i.coco.zip",
-]:
-    if os.path.exists(zname):
-        found_zip = zname
-        break
+# ── verify deps; install ONLY what is missing ───────────────────
+# (local: never -U — upgrading torch/transformers can break a working venv)
+required = {
+    "torch": "torch", "transformers": "transformers", "peft": "peft",
+    "pytorch_metric_learning": "pytorch-metric-learning",
+    "albumentations": "albumentations", "cv2": "opencv-python-headless",
+    "sklearn": "scikit-learn", "onnxruntime": "onnxruntime", "tqdm": "tqdm",
+}
+missing = [pip for mod, pip in required.items() if importlib.util.find_spec(mod) is None]
+if missing:
+    cmd = [sys.executable, "-m", "pip", "install"] + (["-q"] if not IN_COLAB else ["-q", "-U"]) + missing
+    print("installing:", missing)
+    subprocess.run(cmd, check=True)
+else:
+    print("deps OK")
 
-if found_zip is not None and not os.path.exists("/content/dataset/train/_annotations.coco.json"):
-    print("extracting", found_zip)
-    os.makedirs("/content/dataset", exist_ok=True)
-    with zipfile.ZipFile(found_zip, "r") as z:
-        z.extractall("/content/dataset")
+if IN_COLAB:
+    # peft 0.17+ needs torchao >= 0.16 (Colab images ship 0.10)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "torchao"], check=False)
+    print(">>> Colab: if peft/torchao upgraded, Runtime -> Restart session, then continue from cell 1")
+'''))
+
+cells.append(md("## 1) Dataset"))
+cells.append(code('''import os, pathlib, zipfile
 
 DATA_DIR = None
-for c in ["/content/dataset", "dataset", "/content", "."]:
+if IN_COLAB:
+    # upload dataset.zip via the left file panel (or it sits in /content)
+    found_zip = None
+    for zname in [
+        "dataset.zip", "/content/dataset.zip",
+        "Dental Instrument v2.v2i.coco.zip",
+        "/content/Dental Instrument v2.v2i.coco.zip",
+    ]:
+        if os.path.exists(zname):
+            found_zip = zname
+            break
+    if found_zip is not None and not os.path.exists("/content/dataset/train/_annotations.coco.json"):
+        print("extracting", found_zip)
+        os.makedirs("/content/dataset", exist_ok=True)
+        with zipfile.ZipFile(found_zip, "r") as z:
+            z.extractall("/content/dataset")
+    candidates = ["/content/dataset", "dataset", "/content", "."]
+else:
+    # local machine: dataset/ of this repo (or a dataset.zip next to it)
+    here = os.path.dirname(os.path.abspath("__file__")) if False else os.getcwd()
+    if not os.path.exists(os.path.join(here, "dataset", "train", "_annotations.coco.json")) \\
+            and os.path.exists(os.path.join(here, "dataset.zip")):
+        print("extracting local dataset.zip")
+        with zipfile.ZipFile(os.path.join(here, "dataset.zip")) as z:
+            z.extractall(here)
+    candidates = [here, os.path.join(here, ".."), "."]
+
+for c in candidates:
     if os.path.exists(os.path.join(c, "train", "_annotations.coco.json")):
         DATA_DIR = c
         break
 if DATA_DIR is None:
-    raise FileNotFoundError("upload dataset.zip then re-run this cell")
+    raise FileNotFoundError("no train/_annotations.coco.json — put the COCO export in ./dataset (local) or upload dataset.zip (Colab)")
 
-print("DATA_DIR =", DATA_DIR)
+print("DATA_DIR =", os.path.abspath(DATA_DIR))
 for sp in ["train", "valid", "test"]:
     p = pathlib.Path(DATA_DIR, sp)
     if p.exists():
         n_img = sum(1 for _ in list(p.glob("*.jpg")) + list(p.glob("*.png")) + list(p.glob("*.jpeg")))
         print(f"  {sp:6s}: {n_img:4d} images")
-"""))
+'''))
 
-cells.append(md("## 2) Write modules"))
+cells.append(md("""## 2) Write modules
+
+Colab: writes the 16 modules to /content via %%writefile.
+Local: **copies nothing** — the repo .py files ARE the modules (this cell only
+makes sure they are importable and prints a quick inventory).
+"""))
 for mod in MODULES:
     path = os.path.join(ROOT, mod)
     with open(path, encoding="utf-8") as f:
@@ -115,16 +165,31 @@ for mod in MODULES:
     if not src.endswith("\n"):
         src += "\n"
     cells.append(code(f"%%writefile {mod}\n{src}"))
+cells.append(code('''# ── make modules importable ──────────────────────────────────────
+import os, sys
+
+if IN_COLAB:
+    sys.path.insert(0, "/content")
+else:
+    # local: cwd should be the repo root (notebook sits next to the .py files)
+    repo = os.getcwd()
+    sys.path.insert(0, repo)
+    missing = [m for m in ["config", "dataset", "model", "train", "det_model",
+                           "det_dataset", "train_all"] if not os.path.exists(os.path.join(repo, m + ".py"))]
+    if missing:
+        raise FileNotFoundError(f"run the notebook from the repo root (missing {missing})")
+
+import config, dataset, model, train, det_model, det_dataset, train_all  # noqa
+print("modules import OK from", os.path.abspath(config.__file__))
+'''))
 
 cells.append(md("""## 3) Sanity check + patch-paste preview
 
 Confirm class counts, mask overlays, and that copy-paste composites look real
 on the green cloth.
 """))
-cells.append(code("""CALIB_RATIO = None   # set after calibrate.py, e.g. 0.025 cm/px
+cells.append(code('''CALIB_RATIO = None   # set after calibrate.py, e.g. 0.025 cm/px
 
-import sys
-sys.path.insert(0, "/content")
 from collections import Counter
 from dataset import load_coco_records, visualize_records, visualize_patch_paste_samples, compute_length_stats
 
@@ -139,7 +204,7 @@ print(f"length mean={stats[0]:.1f} std={stats[1]:.1f}  unit={'cm' if CALIB_RATIO
 fig1 = visualize_records(train_recs, calibration_ratio=CALIB_RATIO, n=6, seed=7)
 print("--- patch-paste preview (3 extra tools / image) ---")
 fig2 = visualize_patch_paste_samples(train_recs, n=6, max_pastes=3, seed=42)
-"""))
+'''))
 
 cells.append(md("""## 4) Generate lots of multi-instrument images (patch-paste)
 
@@ -210,112 +275,152 @@ acc = (pred == yva).float().mean().item()
 print(f"kNN probe acc={acc:.3f}  (random={1/len(probe_classes):.3f})")
 """))
 
-cells.append(md("""## 6) Train classifier (DINOv2 + length fusion + ArcFace + tip-zoom)
+cells.append(md("""## 6) Train — one command (train_all.py: detector + classifier)
 
-`tip_zoom_prob=0.35` forces the model to see instrument **tips** — the only
-signal for Needle_Holder vs Artery_Forceps and Forceps 23 vs 150 (same length).
+`train_all.py` runs BOTH trainings sequentially with YOLO-style progress
+(tqdm per epoch + ETA + summary tables):
+
+- Stage 1 DETECTOR: DINOv2 + seg head, on-the-fly multi-tool scenes,
+  instance-F1 checkpoint selection
+- Stage 2 CLASSIFIER: DINOv2 + length fusion + ArcFace + CAHM + tip-zoom
+  (`tip_zoom_prob=0.35` — forces the model to learn instrument TIPS, the
+  only signal for Needle_Holder vs Artery_Forceps and 23 vs 150, same length)
+
+Optional: reuse an existing classifier checkpoint — upload `outputs.zip` and
+run the RESUME cell below first, then set `SKIP_CLASSIFIER=True`.
 """))
-cells.append(code("""from config import TrainConfig
-from train import run_training
+cells.append(code('''# ── RESUME (optional): reuse a saved classifier from a previous run ──
+# Colab: upload outputs.zip (left panel). Local: outputs.zip next to the repo.
+# Extracts the checkpoint and points best_ckpt at it.
+import zipfile, os, glob
 
-cfg = TrainConfig(
-    data_dir=DATA_DIR,
-    img_size=560,
-    batch_size=32,
-    finetune_mode="lora",
-    epochs=50,
-    num_workers=2,
-    use_cahm=True,
-    patch_paste_prob=0.4,
-    patch_paste_max_objects=3,
-    tip_zoom_prob=0.35,
-    tip_zoom_size=0.42,
-    calibration_ratio=CALIB_RATIO,
-    output_dir="outputs",
-)
-try:
-    best_ckpt = run_training(cfg)
-except RuntimeError as e:
-    if "out of memory" not in str(e).lower():
-        raise
-    import torch
-    torch.cuda.empty_cache()
-    cfg.batch_size = 16
-    best_ckpt = run_training(cfg)
-print("classifier ckpt:", best_ckpt)
-"""))
+found = None
+for zname in ["outputs.zip", "outputs.zip", "../outputs.zip"]:
+    z = os.path.abspath(zname)
+    if os.path.exists(z):
+        found = z
+        break
 
-cells.append(md("## 7) Evaluate classifier"))
-cells.append(code("""from evaluate import evaluate_checkpoint
+target_dir = "/content" if IN_COLAB else os.getcwd()
+if found and not glob.glob(os.path.join(target_dir, "outputs", "best_model*.pt")) \\
+        and not glob.glob(os.path.join(target_dir, "outputs*", "**", "best_model*.pt"), recursive=True):
+    print("extracting", found)
+    with zipfile.ZipFile(found) as z:
+        z.extractall(target_dir)
+
+cands = sorted(glob.glob(os.path.join(target_dir, "outputs", "best_model*.pt"))
+               + glob.glob(os.path.join(target_dir, "outputs*", "**", "best_model*.pt"), recursive=True))
+if cands:
+    best_ckpt = cands[0]
+    print("reuse classifier:", best_ckpt)
+else:
+    print("no saved classifier found - classifier will be trained fresh")
+
+SKIP_CLASSIFIER = bool(cands)   # True if reusing
+'''))
+
+cells.append(code('''# ── MAIN TRAINING — one command, progress like YOLO ──
+# auto-scales batch sizes to the GPU at hand:
+#   T4 15GB -> det 16 / cls 32 | 8GB -> 8/16 | 4GB (GTX 1650) -> 4/8
+# Windows local kernel -> num_workers 0 (spawn-in-notebook hangs otherwise)
+import subprocess, sys, torch
+
+vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
+print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU?!'} ({vram_gb:.1f} GB)")
+
+if vram_gb >= 14:   bs_det, bs_cls = 16, 32
+elif vram_gb >= 7:  bs_det, bs_cls = 8, 16
+elif vram_gb >= 3:  bs_det, bs_cls = 4, 8
+else:               bs_det, bs_cls = 2, 4
+
+WORKERS = 2 if IN_COLAB else 0
+
+cmd = [
+    sys.executable, "-u", "train_all.py",
+    "--data_dir", DATA_DIR,
+    "--epochs_det", "60",
+    "--epochs_cls", "50",
+    "--batch_det", str(bs_det),
+    "--batch_cls", str(bs_cls),
+    "--num_workers", str(WORKERS),
+]
+if SKIP_CLASSIFIER:
+    cmd.append("--skip_classifier")
+print("cmd:", " ".join(cmd))
+
+proc = subprocess.run(cmd, cwd=os.getcwd() if not IN_COLAB else None)
+raise SystemExit(1) if proc.returncode != 0 else None
+'''))
+
+cells.append(md("""## 7) Evaluate classifier"""))
+cells.append(code('''import glob, os
+cands = sorted(glob.glob(os.path.join(os.getcwd(), "outputs", "best_model*.pt"))
+               + glob.glob(os.path.join(os.getcwd(), "outputs*", "best_model*.pt")))
+if "best_ckpt" not in dir() or not best_ckpt or not os.path.exists(best_ckpt):
+    if not cands:
+        raise FileNotFoundError("no classifier checkpoint — train first or use the RESUME cell")
+    best_ckpt = cands[0]
+
+from evaluate import evaluate_checkpoint
 metrics = evaluate_checkpoint(best_ckpt, data_dir=DATA_DIR)
 print(f"acc={metrics['accuracy']:.4f}  bal={metrics['balanced_accuracy']:.4f}")
+'''))
+
+cells.append(md("""## 8) (Optional) Detector-only training / re-training
+
+Only needed if you want to retrain the detector separately with different
+settings. Stage 1 of the previous cell already trained it.
 """))
-
-cells.append(md("""## 8) Train detector (DINOv2 seg head, no YOLO)
-
-On-the-fly multi-tool scenes every step (2–5 instruments on green cloth +
-shadows) plus the real photos (including the patch-paste images from step 4).
-Best checkpoint is picked by **instance F1** on real val/test photos.
-"""))
-cells.append(code("""from dataclasses import replace
-from config import DetectorConfig
-from train_detector import run_training as run_detector
-
-dcfg = DetectorConfig(
-    data_dir=DATA_DIR,
-    img_size=560,
-    batch_size=8,
-    finetune_mode="lora",
-    epochs=60,
-    num_workers=2,
-    synth_min_objects=2,
-    synth_max_objects=5,
-    synth_max_overlap=0.20,
-    output_dir="outputs_detector",
-)
-try:
-    det_ckpt = run_detector(dcfg)
-except RuntimeError as e:
-    if "out of memory" not in str(e).lower():
-        raise
-    import torch
-    torch.cuda.empty_cache()
-    dcfg = replace(dcfg, batch_size=4)
-    det_ckpt = run_detector(dcfg)
-print("detector ckpt:", det_ckpt)
+cells.append(code("""# ── OPTIONAL — detector only ──
+# from dataclasses import replace
+# from config import DetectorConfig
+# from train_detector import run_training as run_detector
+# dcfg = DetectorConfig(data_dir=DATA_DIR, img_size=560, batch_size=16,
+#                       epochs=60, finetune_mode="lora", num_workers=2)
+# det_ckpt = run_detector(dcfg)
+# print("detector ckpt:", det_ckpt)
 """))
 
 cells.append(md("## 9) Evaluate detector (P/R/F1 + overlays)"))
-cells.append(code("""from evaluate_detector import main as _eval_det
-import sys
+cells.append(code('''import glob, os, sys
+cands = sorted(glob.glob(os.path.join(os.getcwd(), "outputs_detector", "best_detector.pt"))
+               + glob.glob(os.path.join(os.getcwd(), "outputs_detector*", "best_detector.pt")))
+if not cands:
+    raise FileNotFoundError("no detector checkpoint in outputs_detector/")
+det_ckpt = cands[0]
+
+from evaluate_detector import main as _eval_det
 sys.argv = ["evaluate_detector.py", "--ckpt", det_ckpt, "--data_dir", DATA_DIR,
             "--out_dir", "outputs_detector/eval"]
 _eval_det()
-"""))
+'''))
 
 cells.append(md("""## 10) Export ONNX (classifier + detector)
 
 Copy the `onnx_export/` folder to Raspberry Pi 5 (`pi_final_v3/onnx_export/`).
 Calibrate cm/px later on the rig with `calibrate.py`.
 """))
-cells.append(code("""from export_to_onnx import main as export_cls
-from export_detector_onnx import main as export_det
-import sys
+cells.append(code('''import glob, os
+cands = sorted(glob.glob(os.path.join(os.getcwd(), "outputs", "best_model*.pt"))
+               + glob.glob(os.path.join(os.getcwd(), "outputs*", "best_model*.pt")))
+det_cands = sorted(glob.glob(os.path.join(os.getcwd(), "outputs_detector", "best_detector.pt")))
+if not cands or not det_cands:
+    raise FileNotFoundError("missing checkpoints — train first (or RESUME cell for classifier)")
+best_ckpt = cands[0]
+det_ckpt = det_cands[0]
 
-sys.argv = ["export_to_onnx.py", "--ckpt", best_ckpt, "--out_dir", "onnx_export"]
-export_cls()
-sys.argv = ["export_detector_onnx.py", "--ckpt", det_ckpt, "--out_dir", "onnx_export"]
-export_det()
-print("onnx_export contents:")
-import os
-print(os.listdir("onnx_export"))
-"""))
+import export_to_onnx as _ec
+import export_detector_onnx as _ed
+_ec.export_all(best_ckpt, "onnx_export")
+_ed.export_all(det_ckpt, "onnx_export")
+
+print("onnx_export contents:", os.listdir("onnx_export"))
+'''))
 
 cells.append(md("## 11) Download checkpoints + ONNX"))
-cells.append(code("""from google.colab import files
-import os, zipfile
+cells.append(code('''import os, zipfile
 
-zip_path = "/content/dino_detect_classify_export.zip"
+zip_path = os.path.join(os.getcwd(), "dino_detect_classify_export.zip")
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     for folder in ["outputs", "outputs_detector", "onnx_export"]:
         if not os.path.isdir(folder):
@@ -324,9 +429,18 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             for fn in fnames:
                 p = os.path.join(root, fn)
                 z.write(p, p)
-print("zip", zip_path, os.path.getsize(zip_path))
-files.download(zip_path)
-"""))
+print("zip ready:", zip_path, os.path.getsize(zip_path), "bytes")
+
+# browser Colab → auto-download; VS Code / other kernels → grab it from the
+# file explorer (right-click -> Download) or copy to Drive
+try:
+    from google.colab import files
+    files.download(zip_path)
+    print("downloading in browser ...")
+except Exception:
+    print("not in browser-Colab — download it manually from the file explorer:")
+    print("  ", zip_path)
+'''))
 
 cells.append(md("""---
 ### After Colab — realtime on Raspberry Pi 5
