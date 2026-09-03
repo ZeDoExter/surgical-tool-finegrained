@@ -90,7 +90,15 @@ def mask_from_coco_segmentation(segmentation, height: int, width: int) -> np.nda
 
 
 # ============================================================ COCO parsing
-def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]:
+def _is_head_class(class_name: str) -> bool:
+    """True for zoomed-tip classes added in newer Roboflow exports (e.g.
+    'Artery_Forceps_Head'). Whole-instrument flow uses only the 14 full
+    classes — head-only photos are excluded by default."""
+    return class_name.endswith("_Head") or class_name.endswith("-Head")
+
+
+def load_coco_records(data_dir: str, split: str,
+                      include_head_classes: bool = False) -> Tuple[List[dict], List[str]]:
     """
     Read a split folder ("train"/"valid"/"test") containing ``_annotations.coco.json``.
 
@@ -99,6 +107,8 @@ def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]
 
     - label = index from **sorted class names** (stable regardless of
       category_id ordering in the json).
+    - ``*_Head`` categories (zoomed-tip photos) are DROPPED unless
+      ``include_head_classes=True`` — keeps the 14-class flow unchanged.
     - 1 annotation = 1 sample → if one image contains multiple instruments
       it yields multiple samples (recommend using bbox_margin > 0 in
       Dataset to crop per instance).
@@ -114,13 +124,17 @@ def load_coco_records(data_dir: str, split: str) -> Tuple[List[dict], List[str]]
     cat_id_to_name = {c["id"]: c["name"] for c in coco["categories"]}
     # Filter to categories that actually appear (skip dummy super-category like id 0)
     used_names = {cat_id_to_name[ann["category_id"]] for ann in coco["annotations"]}
+    if not include_head_classes:
+        used_names = {n for n in used_names if not _is_head_class(n)}
     class_names = sorted(used_names)
     name_to_label = {n: i for i, n in enumerate(class_names)}
 
     records: List[dict] = []
     for ann in coco["annotations"]:
-        im = images[ann["image_id"]]
         cname = cat_id_to_name[ann["category_id"]]
+        if not include_head_classes and _is_head_class(cname):
+            continue
+        im = images[ann["image_id"]]
         records.append({
             "image_path": os.path.join(split_dir, im["file_name"]),
             "segmentation": ann["segmentation"],
@@ -169,13 +183,14 @@ def load_coco_annotations_for_image(record: dict) -> List[dict]:
             coco = json.load(f)
         cat_id_to_name = {c["id"]: c["name"] for c in coco["categories"]}
         used_names = sorted({cat_id_to_name[a["category_id"]] for a in coco["annotations"]
-                             if a["category_id"] in cat_id_to_name})
+                             if a["category_id"] in cat_id_to_name
+                             and not _is_head_class(cat_id_to_name[a["category_id"]])})
         name_to_label = {n: i for i, n in enumerate(used_names)}
         img_id_by_file = {im["file_name"]: im["id"] for im in coco["images"]}
         anns_by_img: dict = {}
         for a in coco["annotations"]:
             cname = cat_id_to_name.get(a["category_id"])
-            if cname is None or cname not in name_to_label:
+            if cname is None or _is_head_class(cname) or cname not in name_to_label:
                 continue
             anns_by_img.setdefault(a["image_id"], []).append({
                 "segmentation": a["segmentation"],
