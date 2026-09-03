@@ -31,7 +31,11 @@ def main() -> None:
     ap.add_argument("--epochs_cls", type=int, default=50)
     ap.add_argument("--batch_det", type=int, default=16)
     ap.add_argument("--batch_cls", type=int, default=32)
-    ap.add_argument("--img_size", type=int, default=560)
+    ap.add_argument("--img_size_det", type=int, default=448,
+                    help="detector input (448 default = ~1.7x faster on Pi; "
+                         "must be divisible by 14)")
+    ap.add_argument("--img_size_cls", type=int, default=560,
+                    help="classifier input (keep 560 — tip detail matters)")
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--finetune_mode", choices=["lora", "partial", "frozen"], default="lora")
     ap.add_argument("--skip_detector", action="store_true", help="train classifier only")
@@ -44,12 +48,12 @@ def main() -> None:
     det_ckpt = None
     if not args.skip_detector:
         print("\n" + "=" * 70)
-        print("STAGE 1/2 — DETECTOR (DINOv2 + seg head, no YOLO)")
+        print(f"STAGE 1/2 — DETECTOR (DINOv2 + seg head, no YOLO, {args.img_size_det}px)")
         print("=" * 70)
         from config import DetectorConfig
         from train_detector import run_training as run_detector
         dcfg = DetectorConfig(
-            data_dir=args.data_dir, img_size=args.img_size,
+            data_dir=args.data_dir, img_size=args.img_size_det,
             batch_size=args.batch_det, epochs=args.epochs_det,
             finetune_mode=args.finetune_mode, num_workers=args.num_workers,
         )
@@ -58,12 +62,12 @@ def main() -> None:
     cls_ckpt = None
     if not args.skip_classifier:
         print("\n" + "=" * 70)
-        print("STAGE 2/2 — CLASSIFIER (DINOv2 + length fusion + ArcFace + tip-zoom)")
+        print(f"STAGE 2/2 — CLASSIFIER (DINOv2 + length fusion + ArcFace + tip-zoom, {args.img_size_cls}px)")
         print("=" * 70)
         from config import TrainConfig
         from train import run_training
         cfg = TrainConfig(
-            data_dir=args.data_dir, img_size=args.img_size,
+            data_dir=args.data_dir, img_size=args.img_size_cls,
             batch_size=args.batch_cls, epochs=args.epochs_cls,
             finetune_mode=args.finetune_mode, num_workers=args.num_workers,
             use_cahm=True, patch_paste_prob=0.4, tip_zoom_prob=0.35,

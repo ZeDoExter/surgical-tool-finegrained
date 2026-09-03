@@ -30,14 +30,22 @@ def export_int8(fp32_path: str, out_dir: str, data_dir: str = "dataset") -> str:
 
     Calibrates on synthetic scenes from the SAME generator the detector
     trained on (domain-matched), then writes detector_dino_int8.onnx.
+    Reads the model input size from the ONNX graph (works for 560/448).
     Falls back gracefully (returns fp32 path) if quantization deps missing.
     """
     try:
+        import onnx
         from onnxruntime.quantization import (CalibrationDataReader, QuantFormat,
                                               QuantType, quantize_static)
     except ImportError:
         print("[int8] onnxruntime.quantization unavailable -> skip")
         return fp32_path
+
+    # model input size from the graph itself
+    model = onnx.load(fp32_path)
+    in_dim = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
+    img_size = int(in_dim[-1]) if len(in_dim) >= 4 and in_dim[-1] > 0 else 560
+    print(f"[int8] model input size: {img_size}")
 
     # calibration data: 40 synthetic multi-tool scenes through real preprocessing
     import cv2
@@ -55,9 +63,9 @@ def export_int8(fp32_path: str, out_dir: str, data_dir: str = "dataset") -> str:
             self.n = n
             self.data = []
             for _ in range(n):
-                img, _ = synth_scene(pool, 560, 560, rng, min_objects=2, max_objects=4)
+                img, _ = synth_scene(pool, img_size, img_size, rng, min_objects=2, max_objects=4)
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                self.data.append({"pixel_values": preprocess_frame(img_bgr, 560)})
+                self.data.append({"pixel_values": preprocess_frame(img_bgr, img_size)})
 
         def get_next(self):
             if self.i >= self.n:

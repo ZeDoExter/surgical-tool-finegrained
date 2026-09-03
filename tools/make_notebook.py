@@ -320,17 +320,16 @@ SKIP_CLASSIFIER = bool(cands)   # True if reusing
 '''))
 
 cells.append(code('''# ── MAIN TRAINING — one command, progress like YOLO ──
-# auto-scales batch sizes to the GPU at hand:
-#   T4 15GB -> det 16 / cls 32 | 8GB -> 8/16 | 4GB (GTX 1650) -> 4/8
-# Windows local kernel -> num_workers 0 (spawn-in-notebook hangs otherwise)
+# detector @448 (fast on Pi) + classifier @560 (tip detail)
+# auto-scales batch sizes to the GPU at hand; Windows local -> workers 0
 import subprocess, sys, torch
 
 vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
 print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU?!'} ({vram_gb:.1f} GB)")
 
-if vram_gb >= 14:   bs_det, bs_cls = 16, 32
-elif vram_gb >= 7:  bs_det, bs_cls = 8, 16
-elif vram_gb >= 3:  bs_det, bs_cls = 4, 8
+if vram_gb >= 14:   bs_det, bs_cls = 24, 32   # detector @448 fits more
+elif vram_gb >= 7:  bs_det, bs_cls = 12, 16
+elif vram_gb >= 3:  bs_det, bs_cls = 6, 8
 else:               bs_det, bs_cls = 2, 4
 
 WORKERS = 2 if IN_COLAB else 0
@@ -342,6 +341,8 @@ cmd = [
     "--epochs_cls", "50",
     "--batch_det", str(bs_det),
     "--batch_cls", str(bs_cls),
+    "--img_size_det", "448",
+    "--img_size_cls", "560",
     "--num_workers", str(WORKERS),
 ]
 if SKIP_CLASSIFIER:
