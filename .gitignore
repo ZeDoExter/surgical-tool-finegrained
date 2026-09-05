@@ -1,5 +1,7 @@
-__pycache__/
-*.pyc
+*.md
+*.sh
+flashdrive/
+pi_final_v*/
 .venv/
 outputs/
 outputs_ablation/
