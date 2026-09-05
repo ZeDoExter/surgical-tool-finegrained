@@ -1,0 +1,26 @@
+# AMD GPU (ROCm) — use INSIDE WSL2 with the setup_env_wsl.sh script.
+#
+# Using the rocm7.0 torch build (not rocm6.2) because this machine's
+# hsa-runtime-rocr4wsl-amdgpu package (the WSL-compatible GPU runtime
+# shim) is only installed under /opt/rocm-7.2.0. Mixing a rocm6.2 torch
+# build with a 7.x hsa-runtime causes an ABI mismatch that crashes with
+# "free(): invalid pointer" on import. Match torch's ROCm version to
+# whatever `dpkg -L hsa-runtime-rocr4wsl-amdgpu` reports on your machine.
+#
+# Everything else keeps the same pins as requirements-lock.txt; only
+# torch/torchvision differ since 2.5.1/0.20.1 have no rocm7.0 wheel.
+--extra-index-url https://download.pytorch.org/whl/rocm7.0
+torch==2.10.0+rocm7.0
+torchvision==0.25.0+rocm7.0
+transformers==5.16.1
+peft==0.20.0
+pytorch-metric-learning==2.9.0
+albumentations==2.0.8
+numpy==2.5.2
+scikit-learn==1.9.0
+onnxruntime==1.29.0
+opencv-python-headless==5.0.0.93
+tqdm==4.70.0
+matplotlib==3.11.1
+seaborn==0.13.2
+pillow==12.3.0

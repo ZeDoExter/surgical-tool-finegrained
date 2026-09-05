@@ -43,9 +43,12 @@ class DinoDetectorONNX:
         # fp32 first — INT8 quantization broke this ViT graph in tests
         # (kept selectable only if you quantized + verified one yourself)
         if model_file is None:
-            # student CNN first (realtime), DINOv2 as fallback
-            candidates = ["detector_dino_student.onnx",
-                          "detector_dino.onnx", "detector_dino_int8.onnx"]
+            # v7: the full DINOv2 detector is the primary (app.py main path,
+            # best quality). The distilled student CNN stays as fallback for
+            # realtime-priority builds — pass model_file to pick explicitly.
+            candidates = ["detector_dino.onnx",
+                          "detector_dino_student.onnx",
+                          "detector_dino_int8.onnx"]
         else:
             candidates = [model_file]
         onnx_name = next((n for n in candidates

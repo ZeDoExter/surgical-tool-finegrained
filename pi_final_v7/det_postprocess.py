@@ -127,6 +127,7 @@ def instances_from_logits(logits: np.ndarray, classes: List[str],
     if n_comp <= 1:
         return []
 
+
     H, W = logits.shape[1], logits.shape[2]
     out: List[dict] = []
     for ci in range(1, n_comp):

@@ -12,7 +12,12 @@ from typing import List, Optional
 class TrainConfig:
     # ---------------- Data ----------------
     data_dir: str = "dataset"          # folder with train/ and valid/ (Roboflow COCO Segmentation export)
-    img_size: int = 560                # must be divisible by 14 (560=40×14) — from kNN probe experiments (best on full-res data)
+    extra_data_dirs: Optional[List[str]] = None  # MORE dataset folders merged into
+                                                 # train (same 14 classes required)
+    # NOTE: "Dental Instrument v2.v2i.coco.zip" extracted to dataset_v2/ = the
+    # ORIGINAL single-instrument dataset (no WIN_* mix photos). Point data_dir
+    # at it to A/B the mix dataset: dataset/ = with mix, dataset_v2/ = without.
+    img_size: int = 504                # must be divisible by 14 (504=36×14) — from kNN probe experiments (best on full-res data)
     val_fraction: float = 0.2          # used when valid/ folder is missing → stratified split from train
     calibration_ratio: Optional[float] = None  # cm/pixel — measured from a reference object of known size
                                                # (camera rig is fixed, so one ratio works for all images)
@@ -114,6 +119,8 @@ class DetectorConfig:
     """
     # ---------------- Data ----------------
     data_dir: str = "dataset"            # same Roboflow COCO Segmentation export as classifier
+    extra_data_dirs: Optional[List[str]] = None  # MORE dataset folders merged into
+                                                 # train + patch pool (same 14 classes required)
     img_size: int = 560                 # must be divisible by 14 (560=40×14)
     num_workers: int = 2                # set 0 on Windows if DataLoader hangs
     # scene synthesis: paste 2-5 instruments per 560×560 canvas each step

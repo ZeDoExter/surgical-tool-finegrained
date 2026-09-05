@@ -19,6 +19,8 @@ import argparse
 import math
 import os
 import random
+import sys
+import time as _time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -30,7 +32,7 @@ from torch.utils.data import DataLoader
 from pytorch_metric_learning.losses import ArcFaceLoss
 
 from config import TrainConfig
-from dataset import SurgicalInstrumentDataset, compute_length_stats, load_coco_records, stratified_split
+from dataset import SurgicalInstrumentDataset, compute_length_stats, load_coco_records, load_coco_records_multi, stratified_split
 from model import SurgicalDinoFusion, arcface_logits, count_trainable
 
 # ============================================================ utils
@@ -78,11 +80,12 @@ def build_flip_flags(class_names: List[str], cfg: TrainConfig) -> List[bool]:
 
 def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]]:
     """
-    Load records from data_dir:
+    Load records from data_dir (or extra_data_dirs):
       - if valid/_annotations.coco.json exists -> use it directly
       - otherwise -> stratified split from train using val_fraction/seed from config
     """
-    tr, classes = load_coco_records(cfg.data_dir, "train")
+    dirs = [cfg.data_dir] + list(getattr(cfg, "extra_data_dirs", []) or [])
+    tr, classes = load_coco_records_multi(dirs, "train")
     valid_ann = os.path.join(cfg.data_dir, "valid", "_annotations.coco.json")
     if os.path.exists(valid_ann):
         va, classes_valid = load_coco_records(cfg.data_dir, "valid")
@@ -91,6 +94,8 @@ def resolve_records(cfg: TrainConfig) -> Tuple[List[dict], List[dict], List[str]
     else:
         tr, va = stratified_split(tr, cfg.val_fraction, cfg.seed)
         print(f"[data] no valid/ folder -> stratified split {len(tr)}/{len(va)} (seed={cfg.seed})")
+    if len(dirs) > 1:
+        print(f"[data] merged {len(dirs)} dataset folders -> {len(tr)} train records")
     return tr, va, classes
 
 def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
@@ -99,6 +104,16 @@ def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
         return step / max(1, warmup)
     t = min((step - warmup) / max(1, total - warmup), 1.0)
     return 0.5 * (1.0 + math.cos(math.pi * t))
+
+def format_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 # ============================================================ CAHM helpers
@@ -160,8 +175,9 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
     cahm_alpha = float(getattr(cfg, "cahm_alpha", 2.0))
     it = loader
     if tqdm_mod is not None:
-        it = tqdm_mod(loader, desc=f"cls {epoch:03d}/{total_epochs}", unit="batch",
-                      bar_format="{l_bar}{bar:20}{r_bar}", leave=False, dynamic_ncols=True)
+        it = tqdm_mod(loader, desc=f"{epoch}/{total_epochs}", unit="batch",
+                      bar_format="{l_bar}{bar:24}{r_bar}", leave=False, dynamic_ncols=True,
+                      mininterval=1.0, disable=None, file=sys.stderr)
     for batch in it:
         px = batch["image"].to(device, non_blocking=True)
         ln = batch["length"].to(device, non_blocking=True)
@@ -210,10 +226,9 @@ def train_one_epoch(model, loss_fn, loader, optimizer, scheduler, scaler, device
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
         scheduler.step()  # per-step schedule (warmup+cosine)
-
         total += loss.item() * y.size(0)
         seen += y.size(0)
-        if it is not loader and hasattr(it, "set_postfix"):
+        if it is not loader and not getattr(it, "disable", False):
             it.set_postfix(loss=f"{total/max(seen,1):.3f}")
     return total / max(seen, 1)
 
@@ -280,7 +295,8 @@ def run_training(cfg: TrainConfig,
     # length mean/std ← from train only (prevent leakage)
     length_stats = compute_length_stats(records_train, cfg.calibration_ratio)
     print(f"[data] train={len(records_train)} val={len(records_valid)} "
-          f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}")
+          f"classes={len(class_names)} length_mean={length_stats[0]:.2f} std={length_stats[1]:.2f}",
+          flush=True)
 
     flip_flags = build_flip_flags(class_names, cfg)
     ds_train = SurgicalInstrumentDataset(
@@ -298,6 +314,10 @@ def run_training(cfg: TrainConfig,
         records_valid, length_stats, cfg.img_size,
         cfg.calibration_ratio, flip_flags=None, training=False,
         bbox_margin=cfg.bbox_margin,
+        # validation crops stay natural (with visible neighbors) — matching
+        # real deployment where the ViT sees raw detector crops. Erasing only
+        # in train (last round showed a train/val domain gap: 0.9215 < 0.9590)
+        erase_neighbors=False,
     )
     pin = device.type == "cuda"
     dl_train = DataLoader(ds_train, batch_size=cfg.batch_size, shuffle=True,
@@ -311,7 +331,7 @@ def run_training(cfg: TrainConfig,
         partial_last_blocks=cfg.partial_last_blocks, head_dropout=cfg.head_dropout,
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
     ).to(device)
-    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode})")
+    print(f"[model] trainable params = {count_trainable(model):,} (mode={cfg.finetune_mode})", flush=True)
 
     # ArcFace: margin in degrees (~28.6° = 0.5 rad), s=64 — forces embeddings to have
     # tight intra-class / wide inter-class separation, suitable for classes with very similar shapes
@@ -344,7 +364,6 @@ def run_training(cfg: TrainConfig,
     except ImportError:
         def _tqdm(x, **k):
             return x
-    import time as _time
     t_train0 = _time.time()
     # Select best by "val_acc" (val_loss as tiebreak) — simulations show that on small datasets
     # ArcFace val_loss and val_acc conflict (lowest loss != best model); original spec used val loss
@@ -356,6 +375,7 @@ def run_training(cfg: TrainConfig,
     cahm_beta = float(getattr(cfg, "cahm_beta", 0.9))
 
     for epoch in range(1, cfg.epochs + 1):
+        epoch_start = _time.time()
         # pass cahm_d to this epoch if start time has been reached
         cur_cahm = cahm_d if (use_cahm and epoch > cahm_start and cahm_d is not None) else None
         tl = train_one_epoch(model, loss_fn, dl_train, optimizer, scheduler, scaler, device, cfg,
@@ -388,8 +408,7 @@ def run_training(cfg: TrainConfig,
             best.update(val_loss=vl, val_acc=va, epoch=epoch,
                         model={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                         arcface={k: v.detach().cpu().clone() for k, v in loss_fn.state_dict().items()})
-            bad_epochs = 0
-            star = "  *best*"
+            star = " *best*"
             # save immediately — checkpoint survives interruption (file exists even with early stop)
             try:
                 ckpt_immediate = os.path.join(cfg.output_dir, f"best_model{tag}.pt")
@@ -410,14 +429,17 @@ def run_training(cfg: TrainConfig,
         else:
             bad_epochs += 1
         cur_lr = scheduler.get_last_lr()[0]
-        elapsed = _time.time() - t_train0
-        eta = elapsed / epoch * (cfg.epochs - epoch) if epoch < cfg.epochs else 0.0
-        print(f"{tag}[epoch {epoch:03d}/{cfg.epochs}] train={tl:.4f} val={vl:.4f} "
-              f"val_acc={va:.4f} lr={cur_lr:.2e} "
-              f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m{star}", flush=True)
+        epoch_time = _time.time() - epoch_start
+        elapsed_total = _time.time() - t_train0
+        avg_epoch_time = elapsed_total / epoch
+        eta = avg_epoch_time * (cfg.epochs - epoch)
+        epoch_str = f"{epoch_time:.1f}s" if epoch_time < 60 else format_time(epoch_time)
+        print(f"{tag}Epoch {epoch}/{cfg.epochs} {'━' * 40} {epoch_str} | "
+              f"loss={tl:.4f} val={vl:.4f} acc={va:.4f} lr={cur_lr:.2e} "
+              f"ETA={format_time(eta)}{star}", flush=True)
 
         if bad_epochs >= cfg.patience:
-            print(f"[early stop] no improvement for {cfg.patience} epochs — stopping at epoch {epoch}")
+            print(f"[early stop] no improvement for {cfg.patience} epochs — stopping at epoch {epoch}", flush=True)
             break
 
     # ---------- save best checkpoint ----------

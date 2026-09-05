@@ -25,5 +25,10 @@
     "Root_Tip_Elevator_Straight": 14.5
   },
   "calibration_ratio": null,
-  "model": "DINOv2 detector (seg head) — YOLO-free"
+  "model": "DINOv2 detector (seg head) — YOLO-free",
+  "has_patch_tokens": true,
+  "patch_dim": 384,
+  "token_grid": 40,
+  "prototypes": "class_prototypes.npy",
+  "prototypes_built_at": 448
 }

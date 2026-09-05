@@ -20,11 +20,12 @@ Usage:
     python train_student.py --teacher ckpt.pt --export   # + ONNX (fp32) + INT8 (gated)
 """
 import argparse
+import sys
+import time
 import math
 import os
-import random
-from dataclasses import replace
 from typing import List, Optional
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -71,6 +72,17 @@ class StudentSeg(nn.Module):
                 {"params": [p for p in bb if p.requires_grad], "lr": self._lr_backbone}]
 
 
+def format_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
 def distill_loss(stu_logits: torch.Tensor, teacher_logits: torch.Tensor,
                  target: torch.Tensor, cfg: DetectorConfig,
                  kd_weight: float = 0.5) -> tuple:
@@ -88,15 +100,20 @@ def distill_loss(stu_logits: torch.Tensor, teacher_logits: torch.Tensor,
 def run_training(cfg: DetectorConfig, teacher_ckpt: str, img_size: int = 320,
                  kd_weight: float = 0.5, epochs: int = 40,
                  batch_size: int = 16, num_workers: int = 2,
-                 output_dir: str = "outputs_student") -> str:
+                 output_dir: str = "outputs_student",
+                 init_ckpt: Optional[str] = None) -> str:
     os.makedirs(output_dir, exist_ok=True)
     seed_everything(cfg.seed if hasattr(cfg, "seed") else 42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("[data] building patch pool + backgrounds ...")
-    pool, classes = build_patch_pool(cfg.data_dir, min_area=cfg.min_mask_area_px)
-    bg_pool = build_bg_pool(cfg.data_dir, max_n=24)
-    tr_records, _ = load_coco_records(cfg.data_dir, "train")
+    from dataset import load_coco_records_multi
+    pool, classes = build_patch_pool(cfg.data_dir, min_area=cfg.min_mask_area_px,
+                                     extra_data_dirs=getattr(cfg, "extra_data_dirs", None))
+    bg_pool = build_bg_pool(cfg.data_dir, max_n=24,
+                            extra_data_dirs=getattr(cfg, "extra_data_dirs", None))
+    dirs = [cfg.data_dir] + list(getattr(cfg, "extra_data_dirs", []) or [])
+    tr_records, _ = load_coco_records_multi(dirs, "train")
 
     print(f"[teacher] {teacher_ckpt}")
     teacher = load_detector(teacher_ckpt, device=device)["model"].eval()
@@ -118,8 +135,12 @@ def run_training(cfg: DetectorConfig, teacher_ckpt: str, img_size: int = 320,
         real_records=tr_records, real_prob=0.35)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
                     num_workers=num_workers, pin_memory=device.type == "cuda")
-
     model = StudentSeg(num_classes=len(classes)).to(device)
+    if init_ckpt:
+        sd = torch.load(init_ckpt, map_location=device,
+                        weights_only=False)["model_state"]
+        model.load_state_dict(sd)
+        print(f"[student] warm-started from {init_ckpt}")
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[student] trainable={n_tr:,}")
 
@@ -153,12 +174,16 @@ def run_training(cfg: DetectorConfig, teacher_ckpt: str, img_size: int = 320,
             return x
 
     print(f"[train] steps/epoch={len(dl)} epochs={epochs} img={img_size}")
+    t_train0 = time.time()
     for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
         model.train()
         tot, seen = 0.0, 0
         parts = {"ce": 0.0, "dice": 0.0, "kd": 0.0}
-        pbar = tqdm(dl, desc=f"{epoch:03d}/{epochs}", unit="batch",
-                    bar_format="{l_bar}{bar:20}{r_bar}", leave=False, dynamic_ncols=True)
+        pbar = tqdm(dl, desc=f"{epoch}/{epochs}", unit="batch",
+                    bar_format="{l_bar}{bar:24}{r_bar}", leave=False,
+                    dynamic_ncols=True, mininterval=1.0,
+                    disable=None, file=sys.stderr)
         for batch in pbar:
             px = batch["image"].to(device, non_blocking=True)
             tgt = batch["target"].to(device, non_blocking=True)
@@ -186,12 +211,14 @@ def run_training(cfg: DetectorConfig, teacher_ckpt: str, img_size: int = 320,
             scheduler.step()
             tot += loss.item() * px.size(0)
             seen += px.size(0)
-            pbar.set_postfix(loss=f"{loss.item():.3f}", kd=f"{parts['kd']:.3f}")
+            if not getattr(pbar, "disable", False):
+                pbar.set_postfix(loss=f"{loss.item():.3f}",
+                                 ce=f"{parts['ce']:.3f}", dice=f"{parts['dice']:.3f}")
         tr_loss = tot / max(seen, 1)
 
         metrics = validate_instances(model, val_records, classes, vcfg, device)
         improved = metrics["f1"] > best["f1"] + 1e-4
-        star = "  *best*" if improved else ""
+        star = " *best*" if improved else ""
         if improved:
             best.update(f1=metrics["f1"], epoch=epoch,
                         state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
@@ -205,9 +232,15 @@ def run_training(cfg: DetectorConfig, teacher_ckpt: str, img_size: int = 320,
             }, ckpt_path)
         else:
             bad += 1
-        print(f"[epoch {epoch:03d}/{epochs}] loss={tr_loss:.4f} "
-              f"val: P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
-              f"F1={metrics['f1']:.3f} IoU={metrics['mean_iou']:.3f}{star}", flush=True)
+        epoch_time = time.time() - epoch_start
+        elapsed_total = time.time() - t_train0
+        avg_epoch_time = elapsed_total / epoch
+        eta = avg_epoch_time * (epochs - epoch)
+        epoch_str = f"{epoch_time:.1f}s" if epoch_time < 60 else format_time(epoch_time)
+        print(f"Epoch {epoch}/{epochs} {'━' * 40} {epoch_str} | "
+              f"loss={tr_loss:.4f} P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
+              f"F1={metrics['f1']:.3f} IoU={metrics['mean_iou']:.3f} "
+              f"ETA={format_time(eta)}{star}", flush=True)
         if bad >= patience:
             print(f"[early stop] patience {patience}")
             break
@@ -348,6 +381,9 @@ def main(argv=None) -> None:
     ap.add_argument("--kd_weight", type=float, default=0.5)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--output_dir", default="outputs_student")
+    ap.add_argument("--init_ckpt", default=None,
+                    help="warm-start weights from a previous student run "
+                         "(e.g. after a crash — LR schedule restarts fresh)")
     ap.add_argument("--export", action="store_true")
     ap.add_argument("--export_int8", action="store_true")
     args = ap.parse_args(argv)
@@ -357,7 +393,7 @@ def main(argv=None) -> None:
     ckpt = run_training(cfg, args.teacher, img_size=args.img_size,
                         kd_weight=args.kd_weight, epochs=args.epochs,
                         batch_size=args.batch_size, num_workers=args.num_workers,
-                        output_dir=args.output_dir)
+                        output_dir=args.output_dir, init_ckpt=args.init_ckpt)
     if args.export:
         export_all_student(ckpt, "pi_final_v3/onnx_export",
                            img_size=args.img_size, int8=args.export_int8)

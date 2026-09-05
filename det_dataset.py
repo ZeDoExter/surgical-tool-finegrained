@@ -34,8 +34,8 @@ from torch.utils.data import Dataset
 
 from dataset import (
     IMAGENET_MEAN, IMAGENET_STD, build_photometric_aug,
-    extract_instrument_patch, load_coco_records, mask_from_coco_segmentation,
-    simulate_shadow, transform_instrument_patch,
+    extract_instrument_patch, load_coco_records, load_coco_records_multi,
+    mask_from_coco_segmentation, simulate_shadow, transform_instrument_patch,
 )
 
 # background channel index (class 0); instrument classes start at 1
@@ -152,7 +152,8 @@ def synth_scene(patch_pool: List[dict], h: int, w: int, rng: random.Random,
 
 
 def build_patch_pool(data_dir: str, min_area: int = 120,
-                     max_pool: int = 400) -> Tuple[List[dict], List[str]]:
+                     max_pool: int = 400,
+                     extra_data_dirs: Optional[List[str]] = None) -> Tuple[List[dict], List[str]]:
     """
     Extract instrument foreground patches + class list (labels start at 1).
 
@@ -161,17 +162,18 @@ def build_patch_pool(data_dir: str, min_area: int = 120,
     thousands of them after augment_dataset, which made this step take
     ~10x longer for zero new information.
     """
-    tr_records, classes = load_coco_records(data_dir, "train")
+    dirs = [data_dir] + list(extra_data_dirs or [])
+    tr_records, classes = load_coco_records_multi(dirs, "train")
     records = [r for r in tr_records
                if "aug_patchpaste_" not in os.path.basename(r["image_path"])]
-    va_path = os.path.join(data_dir, "valid", "_annotations.coco.json")
-    if os.path.exists(va_path):
-        va_records, _ = load_coco_records(data_dir, "valid")
-        records += [r for r in va_records
-                    if "aug_patchpaste_" not in os.path.basename(r["image_path"])]
+    for d in dirs:
+        va_path = os.path.join(d, "valid", "_annotations.coco.json")
+        if os.path.exists(va_path):
+            va_records, _ = load_coco_records(d, "valid")
+            records += [r for r in va_records
+                        if "aug_patchpaste_" not in os.path.basename(r["image_path"])]
     print(f"[patch pool] extracting from {len(records)} original photos "
-          f"(skipping {len(tr_records) - len(records) + (len(va_records) if os.path.exists(va_path) else 0) - (len(records) - len([r for r in tr_records if 'aug_patchpaste_' not in os.path.basename(r['image_path'])]))} augmented) ...",
-          flush=True)
+          f"across {len(dirs)} dataset folder(s) ...", flush=True)
     pool: List[dict] = []
     for i, r in enumerate(records):
         if i % 50 == 0:
@@ -189,10 +191,12 @@ def build_patch_pool(data_dir: str, min_area: int = 120,
     return pool, classes
 
 
-def build_bg_pool(data_dir: str, max_n: int = 24) -> List[np.ndarray]:
+def build_bg_pool(data_dir: str, max_n: int = 24,
+                  extra_data_dirs: Optional[List[str]] = None) -> List[np.ndarray]:
     """Real backgrounds: original photos with the instrument erased (cloth visible).
     Skips patch-paste composites (their mask only covers one of several tools)."""
-    records, _ = load_coco_records(data_dir, "train")
+    dirs = [data_dir] + list(extra_data_dirs or [])
+    records, _ = load_coco_records_multi(dirs, "train")
     records = [r for r in records
                if "aug_patchpaste_" not in os.path.basename(r["image_path"])]
     rng = random.Random(0)

@@ -6,13 +6,15 @@ outputs_ablation/
 outputs_detector/
 ablation/
 dataset/
-colab_upload/
+dataset_v2/
+dataset_yolo/
+geometry_test/
 from_colab/
 model/
 yolo/
 *.pt
-*.pth
 *.zip
+*.tar.gz
 *.onnx
 *.onnx.data
 *.param

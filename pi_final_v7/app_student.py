@@ -1,63 +1,70 @@
 # -*- coding: utf-8 -*-
 """
-pi_final_v3/app.py — realtime DINOv2 detector + fine-grained classifier on Pi 5
+pi_final_v5/app_student.py — student CNN boxes+mask (fastest) + DINOv2 labels
 
-NO YOLO / ultralytics. Detector is DINOv2-seg ONNX; classifier is the existing
-DINOv2-ArcFace ONNX with tip TTA + mask length.
+Same architecture as app_dinoyolo.py but the detector is our distilled
+student CNN (LRASPP-MobileNetV3, ~20ms/frame on the Pi's CPU class) via
+DinoDetectorONNX, which auto-selects detector_dino_student.onnx when
+present (falls back to the DINOv2 ViT otherwise). Unlike YOLO it also
+produces a real MASK per instrument -> length_cm comes from minAreaRect,
+not the bbox diagonal, so cm values on angled tools are more accurate.
 
     pip install onnxruntime opencv-python flask flask-cors numpy
-    python app.py
+    python app_student.py
 """
-import os
 import time
 import threading
 
 import cv2
-import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
 from detector_onnx import DinoDetectorONNX
 from dino_classifier_onnx import DinoClassifierONNX
-from fast_classifier import FastClassifier
 
 API_KEY = "e5bdb16ce0552c091383244b3c814ffe51bd15fa73e0bc6f4dc7b09afe00a6a67d2bcc02d3ec3accceec4357b05d275a4cc5e98667b47cae0c154fc55c864f13"
 DETECT_DIR = "onnx_export"
 CLASSIFY_DIR = "onnx_export"
 CLASSIFY_REFRESH_SEC = 5.0
-STICKY_CONFIRMED_SEC = 60.0     # once a track is answered CONFIDENTLY, stop
-                                # re-asking the classifier for a minute — tools
+STICKY_CONFIRMED_SEC = 60.0     # confident labels stick for a minute — tools
                                 # don't change identity on a table
-CLASSIFY_MAX_PER_PASS = 2      # budget per loop pass — never starve the detector
-FAST_MODE = True               # zero-cost prototype labels first; the slow
-                               # ArcFace classifier only refines unsure tracks
+CLASSIFY_MAX_PER_PASS = 2      # budget per loop pass — never starve YOLO
 IOU_MATCH = 0.3
 
-# CPU budget on Pi 5 (4 cores): detector gets the most (it gates the visual
-# latency), classifier runs on fewer threads but only when a new track needs
-# labeling. Camera/annotate threads are I/O-bound and need almost no CPU.
-DETECT_THREADS = 3
+# YOLO is cheap; classifier ViT needs the bigger share
+DETECT_THREADS = 2
 CLASSIFY_THREADS = 2
 
-# one fixed DARK color per class (BGR) — white text reads well on all of
-# them; light colors (yellow/cyan) were unreadable and are gone
+# same dark palette as app.py (white text readable on all)
 CLASS_COLORS_BGR = [
     (0, 0, 180),        # Artery_Forceps            dark red
-    (20, 140, 180),      # Cartridge_Syringe         amber
-    (180, 60, 0),        # Cotton_Piler              navy
-    (160, 0, 160),       # Dental_Mirror             dark magenta
-    (130, 130, 0),       # Forceps_23                dark teal
-    (200, 70, 30),       # Forceps_150               dark blue
-    (0, 110, 220),       # Needle_Holder             orange
-    (120, 60, 200),      # Root_Elevators            dark pink
-    (90, 90, 90),        # Root_Tip_Elevator_LR     dark gray
-    (40, 20, 130),       # Root_Tip_Elevator_Straight maroon
-    (30, 110, 110),      # Root_Tip_Pick             olive
-    (60, 140, 0),        # Scapel_Handle             dark green
-    (180, 30, 110),      # Suture_Scissors           dark violet
-    (130, 90, 70),       # Triple_Syringe            dark slate
+    (20, 140, 180),     # Cartridge_Syringe         amber
+    (180, 60, 0),       # Cotton_Piler              navy
+    (160, 0, 160),      # Dental_Mirror             dark magenta
+    (130, 130, 0),      # Forceps_23                dark teal
+    (200, 70, 30),      # Forceps_150               dark blue
+    (0, 110, 220),      # Needle_Holder             orange
+    (120, 60, 200),     # Root_Elevators            dark pink
+    (90, 90, 90),       # Root_Tip_Elevator_LR     dark gray
+    (40, 20, 130),      # Root_Tip_Elevator_Straight maroon
+    (30, 110, 110),     # Root_Tip_Pick             olive
+    (60, 140, 0),       # Scapel_Handle             dark green
+    (180, 30, 110),     # Suture_Scissors           dark violet
+    (130, 90, 70),      # Triple_Syringe            dark slate
 ]
 UNKNOWN_COLOR_BGR = (0, 0, 180)
+
+app = Flask(__name__)
+CORS(app)
+
+print("[student] loading ONNX ...", flush=True)
+detector = DinoDetectorONNX(DETECT_DIR, num_threads=DETECT_THREADS)
+print(f"[student] classes {len(detector.classes)} backend={detector.backend} "
+      f"warmup={detector.last_ms:.0f}ms nms_iou={detector.nms_iou}", flush=True)
+print("[classifier] loading ONNX ...", flush=True)
+classifier = DinoClassifierONNX(CLASSIFY_DIR, num_threads=CLASSIFY_THREADS)
+print(f"[classifier] loaded backend={classifier.backend}", flush=True)
+
 
 def class_color(cls_name: str):
     try:
@@ -66,27 +73,9 @@ def class_color(cls_name: str):
     except (ValueError, AttributeError):
         return UNKNOWN_COLOR_BGR
 
-app = Flask(__name__)
-CORS(app)
-
-print("[detector] loading ONNX ...", flush=True)
-detector = DinoDetectorONNX(DETECT_DIR, num_threads=DETECT_THREADS)
-print(f"[detector] classes {detector.classes} backend={detector.backend} "
-      f"warmup={detector.last_ms:.0f}ms", flush=True)
-print("[classifier] loading ONNX ...", flush=True)
-classifier = DinoClassifierONNX(CLASSIFY_DIR, num_threads=CLASSIFY_THREADS)
-print(f"[classifier] loaded backend={classifier.backend}", flush=True)
-fast_clf = None
-try:
-    fast_clf = FastClassifier(DETECT_DIR)
-    print(f"[fast] prototypes loaded ({fast_clf.P.shape[1]} classes) — "
-          "zero-cost labels, ArcFace as fallback", flush=True)
-except Exception as e:
-    print(f"[fast] prototypes unavailable ({e}) — ArcFace for everything", flush=True)
-
 
 class IoUTracker:
-    """Tiny greedy IoU tracker (replaces ByteTrack — tools barely move on the cloth)."""
+    """Tiny greedy IoU tracker (tools barely move on the cloth)."""
 
     def __init__(self, iou_thr: float = 0.3, max_age: int = 15):
         self.iou_thr = iou_thr
@@ -134,7 +123,6 @@ last_detection_time = 0
 output_frame = None
 latest_raw_frame = None
 last_instances = []
-last_tokens = None   # patch tokens paired with last_instances (same detect pass)
 fine_grained_cache = {}
 frame_lock = threading.Lock()
 detect_lock = threading.Lock()
@@ -143,7 +131,7 @@ cache_lock = threading.Lock()
 
 
 def detect_loop():
-    global last_instances, latest_detections, last_detection_time, last_tokens
+    global last_instances, latest_detections, last_detection_time
     while True:
         frame = None
         with raw_lock:
@@ -153,13 +141,12 @@ def detect_loop():
             time.sleep(0.01)
             continue
         try:
-            # realtime path: NO tip crops here (crop extraction costs ~2-4ms
-            # per instance) — the classifier thread cuts tips itself only for
-            # tracks it actually needs to (re)label
-            insts = detector.detect(frame, want_tip_crops=False)
+            # tip crops are cut here once per frame — classify_loop reuses them
+            # when a track needs (re)labeling (saves the crop cost in that thread)
+            insts = detector.detect(frame, want_tip_crops=True)
             insts = tracker.update(insts)
         except Exception as e:
-            print(f"[detector] {e}", flush=True)
+            print(f"[student] {e}", flush=True)
             time.sleep(0.05)
             continue
         counts = {}
@@ -168,35 +155,29 @@ def detect_loop():
             counts[n] = counts.get(n, 0) + 1
         with detect_lock:
             last_instances = insts
-            last_tokens = detector.last_tokens  # paired with these instances
             latest_detections = counts
             last_detection_time = time.time()
 
 
 def classify_loop():
-    import det_postprocess as pp
     while True:
         frame = None
         insts = None
-        toks = None
         with raw_lock:
             if latest_raw_frame is not None:
                 frame = latest_raw_frame.copy()
         with detect_lock:
             insts = list(last_instances)
-            toks = last_tokens
         if frame is None or not insts:
             time.sleep(0.2)
             continue
         now = time.time()
         h, w = frame.shape[:2]
-        # resize frame once for tip-crop coordinate space (same as detector)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_model = cv2.resize(rgb_frame, (detector.img_size, detector.img_size))
         done_this_pass = 0
         for inst in insts:
             if done_this_pass >= CLASSIFY_MAX_PER_PASS:
-                break   # leave CPU for the detector — rest waits for next pass
+                break   # leave CPU for YOLO — remaining tracks wait for next pass
             tid = inst.get("track_id")
             if tid is None:
                 continue
@@ -209,28 +190,6 @@ def classify_loop():
                 # low-confidence answers retry at the normal cadence
                 if (now - cached["ts"]) < CLASSIFY_REFRESH_SEC:
                     continue
-            # ---- FAST PATH: zero-cost prototype label from the SAME forward
-            # the detector already ran (mask-pool its patch tokens). The slow
-            # ArcFace model only runs when this path is unsure.
-            fast_res = None
-            if FAST_MODE and fast_clf is not None and toks is not None:
-                try:
-                    emb = detector.pool_tokens(inst.get("mask"), toks)
-                    if emb is not None:
-                        fast_res = fast_clf.predict(
-                            emb, length_cm=inst.get("length_cm"))
-                except Exception:
-                    fast_res = None
-            if fast_res is not None and not fast_res["need_refine"]:
-                with cache_lock:
-                    fine_grained_cache[int(tid)] = {
-                        "class": fast_res["class"],
-                        "confidence": fast_res["confidence"],
-                        "length_used": 0.0, "ts": now,
-                        "confirmed": bool(fast_res["confidence"] >= 0.70),
-                        "via": "fast",
-                    }
-                continue  # no ViT forward spent at all
             x1, y1, x2, y2 = [int(v) for v in inst["bbox_frame"]]
             x1, y1 = max(x1, 0), max(y1, 0)
             x2, y2 = min(x2, w), min(y2, h)
@@ -244,23 +203,18 @@ def classify_loop():
                     tip_crops=None,
                     length_cm=inst.get("length_cm"),
                 )
-                # unsure first pass (small gap on a same-length pair) -> run
-                # tip TTA once for this track with freshly-cut tips
-                if (res["confidence"] < 0.55 and inst.get("mask") is not None
-                        and res.get("top3") and len(res["top3"]) > 1):
-                    m = inst["mask"]
-                    if m.shape[:2] != rgb_model.shape[:2]:
-                        m = cv2.resize(m, (detector.img_size, detector.img_size),
-                                       interpolation=cv2.INTER_NEAREST)
-                    tips = pp.extract_tip_crops(rgb_model, m)
-                    if tips:
-                        res = classifier.classify(
-                            crop, x2 - x1, y2 - y1,
-                            length_px=inst.get("length_px_frame"),
-                            tip_crops=tips,
-                            length_cm=inst.get("length_cm"),
-                            force_tip_tta=True,
-                        )
+                # unsure first pass -> tip TTA from the pre-cut box-end crops
+                # (YOLO has no mask; box ends cover the jaws for most poses)
+                if (res["confidence"] < 0.55
+                        and res.get("top3") and len(res["top3"]) > 1
+                        and inst.get("tip_crops")):
+                    res = classifier.classify(
+                        crop, x2 - x1, y2 - y1,
+                        length_px=inst.get("length_px_frame"),
+                        tip_crops=inst.get("tip_crops"),
+                        length_cm=inst.get("length_cm"),
+                        force_tip_tta=True,
+                    )
             except Exception as e:
                 print(f"[classifier] {e}", flush=True)
                 continue
@@ -368,7 +322,7 @@ def detects():
 
 @app.route("/")
 def index():
-    return "DENIS DINOv2 Detector + Fine-Grained Server Running v3.0 (no YOLO)"
+    return "DENIS YOLO26n boxes + DINOv2 labels Server Running v3.1"
 
 
 threading.Thread(target=camera_loop, daemon=True).start()

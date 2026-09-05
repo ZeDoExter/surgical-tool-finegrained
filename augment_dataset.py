@@ -137,9 +137,17 @@ def paste_instrument_with_annotation(
 
 
 def augment_dataset(data_dir: str, num_aug: int = 2, max_pastes: int = 2,
-                     max_overlap: float = 0.20, seed: int = 42) -> None:
+                     max_overlap: float = 0.20, seed: int = 42,
+                     max_base_anns: int = 6) -> None:
     """
     Generate mask-aware patch-paste augmented training data and update COCO json.
+
+    - ``*_Head`` annotations are NEVER copied into new images (head-only crops
+      are not wanted anywhere in the flow).
+    - base images that already have >= ``max_base_anns`` annotations are
+      SKIPPED (they are already rich multi-tool scenes; pasting more would
+      only create unrealistic clutter and cover real tools, since the
+      placement fallback ignores overlap when it can't find a spot).
     """
     train_dir = os.path.join(data_dir, "train")
     ann_path = os.path.join(train_dir, "_annotations.coco.json")
@@ -175,9 +183,12 @@ def augment_dataset(data_dir: str, num_aug: int = 2, max_pastes: int = 2,
     new_annotations = []
     total_generated = 0
 
-    # Group original annotations by image_id
+    # Group original annotations by image_id (drop *_Head: head-only crops
+    # must not propagate into generated images)
     anns_by_img = {}
     for a in annotations:
+        if cat_id_to_name.get(a["category_id"], "").endswith("_Head"):
+            continue
         anns_by_img.setdefault(a["image_id"], []).append(a)
 
     for im in images:
@@ -187,6 +198,8 @@ def augment_dataset(data_dir: str, num_aug: int = 2, max_pastes: int = 2,
             continue
         base_rgb = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2RGB)
         orig_anns = anns_by_img.get(im["id"], [])
+        if len(orig_anns) >= max_base_anns:
+            continue  # already a rich multi-tool scene — don't clutter it further
 
         for aug_idx in range(num_aug):
             max_img_id += 1

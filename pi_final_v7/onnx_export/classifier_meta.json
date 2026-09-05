@@ -15,11 +15,11 @@
     "Suture_Scissors",
     "Triple_Syringe"
   ],
-  "length_mean": 565.2544041059274,
-  "length_std": 231.61492588024788,
+  "length_mean": 608.5921123469855,
+  "length_std": 250.46976159702965,
   "calibration_ratio": null,
   "scale": 64.0,
-  "img_size": 560,
+  "img_size": 504,
   "real_length_cm": {
     "Root_Elevators": 15.5,
     "Root_Tip_Elevator_Straight": 14.5

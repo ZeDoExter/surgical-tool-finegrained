@@ -117,6 +117,34 @@ def load_coco_records(data_dir: str, split: str,
     ann_path = os.path.join(split_dir, "_annotations.coco.json")
     if not os.path.exists(ann_path):
         raise FileNotFoundError(f"Annotation file not found: {ann_path}")
+    return _load_coco_split(split_dir, ann_path, include_head_classes)
+
+
+def load_coco_records_multi(data_dirs: List[str], split: str,
+                            include_head_classes: bool = False) -> Tuple[List[dict], List[str]]:
+    """
+    Load one split from MULTIPLE dataset folders and concatenate the records
+    (e.g. dataset/ + dataset_extra/). Class names must be the SAME sorted list
+    in every folder — enforced, since the label space must stay consistent.
+    """
+    all_records: List[dict] = []
+    ref_classes: List[str] = None
+    for d in data_dirs:
+        recs, classes = load_coco_records(d, split, include_head_classes)
+        if ref_classes is None:
+            ref_classes = classes
+        elif classes != ref_classes:
+            raise ValueError(
+                f"Class lists differ across dataset folders.\n"
+                f"  {data_dirs[0]}: {ref_classes}\n  {d}: {classes}\n"
+                f"Every folder must contain the same 14 class names (in train at least)."
+            )
+        all_records.extend(recs)
+    return all_records, ref_classes
+
+
+def _load_coco_split(split_dir: str, ann_path: str,
+                     include_head_classes: bool) -> Tuple[List[dict], List[str]]:
     with open(ann_path, "r", encoding="utf-8") as f:
         coco = json.load(f)
 
@@ -613,6 +641,13 @@ def build_photometric_aug() -> A.Compose:
 
     Critically, there is *no* crop/scale/cutout because "size and shape"
     are what the model must learn to separate visually similar classes.
+
+    v3 additions (targeting live-camera failure modes):
+      - GaussNoise: webcam sensor noise at low light
+      - ImageCompression: MJPEG stream artifacts (we serve JPEG quality 80)
+      - Downscale: camera feed softness / slight defocus at distance
+      - MotionBlur: slight camera/reflection movement between frames
+    All photometric-only — scale/length features stay intact.
     """
     return A.Compose([
         A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.5),             # boost local contrast (metal on green cloth has low contrast; shadows worsen it)
@@ -620,6 +655,10 @@ def build_photometric_aug() -> A.Compose:
         A.RandomGamma(gamma_limit=(70, 150), p=0.7),                        # simulate different exposure / lighting
         A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=15, p=0.3),
         A.GaussianBlur(blur_limit=(3, 7), p=0.2),                           # slight defocus blur
+        A.GaussNoise(std_range=(0.02, 0.08), p=0.2),                        # sensor noise (v3)
+        A.ImageCompression(quality_range=(60, 95), p=0.25),                # JPEG/MJPEG artifacts (v3)
+        A.Downscale(scale_range=(0.6, 0.95), p=0.15),                       # soft focus / low-res feed (v3)
+        A.MotionBlur(blur_limit=(3, 7), p=0.1),                             # slight motion between frames (v3)
     ])
 
 
@@ -689,8 +728,13 @@ def stratified_split(records: List[dict], val_fraction: float = 0.2, seed: int =
     from sklearn.model_selection import train_test_split
     y = [r["label"] for r in records]
     tr, va = train_test_split(records, test_size=val_fraction, random_state=seed, stratify=y)
-    return tr, va
 
+def _seg_key(seg) -> bytes:
+    """Stable content key for a COCO segmentation so a record can recognize
+    its own polygons among the image's other annotations."""
+    if not isinstance(seg, list):
+        return b""
+    return b"|".join(np.asarray(p, dtype=np.float64).tobytes() for p in seg)
 
 # ============================================================ PyTorch Dataset
 class SurgicalInstrumentDataset(Dataset):
@@ -718,16 +762,16 @@ class SurgicalInstrumentDataset(Dataset):
                  flip_flags: Optional[List[bool]] = None, training: bool = True,
                  bbox_margin: float = 0.0, cutmix_prob: float = 0.0,
                  patch_paste_prob: float = 0.0, patch_paste_max_objects: int = 2,
-                 patch_paste_max_overlap: float = 0.20,
-                 tip_zoom_prob: float = 0.0, tip_zoom_size: float = 0.42,
-                 coco_json: Optional[str] = None,
-                 rotate_prob: float = 0.5, rotate_range: Tuple[float, float] = (-180.0, 180.0),
-                 hard_classes: Optional[List[str]] = None, hard_tip_zoom_prob: float = 0.7):
+                 hard_classes: Optional[List[str]] = None, hard_tip_zoom_prob: float = 0.7,
+                 erase_neighbors: bool = False):
         self.records = records
         self.length_mean, self.length_std = length_stats
         self.training = training
         self.bbox_margin = bbox_margin
         self.img_size = img_size
+        self.erase_neighbors = erase_neighbors  # default OFF: measured R1/R2/R3
+                                                # (0.9215/0.8848/0.9319) — erasing
+                                                # train crops hurts transfer
         # Support both patch_paste_prob and legacy cutmix_prob
         self.patch_paste_prob = patch_paste_prob if patch_paste_prob > 0 else cutmix_prob if training else 0.0
         self.patch_paste_max_objects = patch_paste_max_objects
@@ -774,7 +818,35 @@ class SurgicalInstrumentDataset(Dataset):
             return 0, 0, mask.shape[1], mask.shape[0]
         return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
+    def _erase_neighbors(self, img: np.ndarray, r: dict) -> np.ndarray:
+        """
+        Paint neighboring instruments (other annotations in the same image)
+        with green cloth so this instrument's crop never contains a tip of a
+        different tool that would poison the class label (mix dataset).
+        """
+        if not self.erase_neighbors:
+            return img
+        H, W = img.shape[:2]
+        self_key = _seg_key(r["segmentation"])
+        canvas = np.zeros((H, W), np.uint8)
+        n_others = 0
+        for a in load_coco_annotations_for_image(r):
+            if a["class_name"] == r["class_name"] and \
+                    _seg_key(a["segmentation"]) == self_key:
+                continue  # this record itself (or its merged duplicate)
+            polys = a["segmentation"] if isinstance(a["segmentation"], list) else []
+            for poly in polys:
+                pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+                cv2.fillPoly(canvas, [pts.astype(np.int32)], 1)
+                n_others += 1
+        if n_others:
+            img = img.copy()
+            img[canvas > 0] = (60, 120, 70)  # cloth green (RGB)
+        return img
+
     def _maybe_crop(self, img: np.ndarray, r: dict) -> np.ndarray:
+        """Validation-time crop around this instance's bbox (no neighbor erase
+        here — erase already ran on the full image before cropping)."""
         m = self.bbox_margin
         x1, y1, x2, y2 = segmentation_bbox(r["segmentation"], r["width"], r["height"])
         dx, dy = int((x2 - x1) * m), int((y2 - y1) * m)
@@ -788,6 +860,7 @@ class SurgicalInstrumentDataset(Dataset):
         if img is None:
             raise IOError(f"Failed to read image: {r['image_path']}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = self._erase_neighbors(img, r)
 
         if self.training:
             target_mask = mask_from_coco_segmentation(r["segmentation"], r["height"], r["width"])

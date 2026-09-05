@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import random
+import sys
 import time
 from dataclasses import replace
 from typing import List, Optional, Tuple
@@ -35,8 +36,7 @@ from torch.utils.data import DataLoader
 import cv2
 
 from config import DetectorConfig
-from det_dataset import (BG, DetectorSynthDataset, build_bg_pool,
-                         build_patch_pool, make_grid_targets)
+from det_dataset import DetectorSynthDataset, build_bg_pool, build_patch_pool
 from det_model import SurgicalDinoDetector, count_trainable
 from det_postprocess import instances_from_logits
 from dataset import load_coco_records, mask_from_coco_segmentation
@@ -54,6 +54,16 @@ def warmup_cosine_factor(step: int, warmup: int, total: int) -> float:
         return step / max(1, warmup)
     t = min((step - warmup) / max(1, total - warmup), 1.0)
     return 0.5 * (1.0 + math.cos(math.pi * t))
+
+def format_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 # ---------------- losses ----------------
@@ -182,24 +192,34 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
     seed_everything(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("[data] building patch pool + backgrounds ...")
-    pool, classes = build_patch_pool(cfg.data_dir, min_area=cfg.min_mask_area_px)
-    bg_pool = build_bg_pool(cfg.data_dir, max_n=24)
-    print(f"[data] patches={len(pool)} classes={len(classes)} bg_pool={len(bg_pool)}")
+    print("[data] building patch pool + backgrounds ...", flush=True)
+    from dataset import load_coco_records_multi
+    dirs = [cfg.data_dir] + list(getattr(cfg, "extra_data_dirs", []) or [])
+    pool, classes = build_patch_pool(cfg.data_dir, min_area=cfg.min_mask_area_px,
+                                     extra_data_dirs=getattr(cfg, "extra_data_dirs", None))
+    bg_pool = build_bg_pool(cfg.data_dir, max_n=24,
+                            extra_data_dirs=getattr(cfg, "extra_data_dirs", None))
+    print(f"[data] patches={len(pool)} classes={len(classes)} bg_pool={len(bg_pool)}", flush=True)
     if not pool:
         raise RuntimeError("patch pool is empty — check dataset/train")
 
     # real records for the "real-scene" mix inside training (and val on real photos)
-    tr_records, _ = load_coco_records(cfg.data_dir, "train")
-    va_records, _ = (load_coco_records(cfg.data_dir, "valid")
-                     if os.path.exists(os.path.join(cfg.data_dir, "valid", "_annotations.coco.json"))
-                     else ([], None))
+    tr_records, _ = load_coco_records_multi(dirs, "train")
+    va_ann = os.path.join(cfg.data_dir, "valid", "_annotations.coco.json")
+    if os.path.exists(va_ann):
+        va_records, _ = load_coco_records_multi(dirs, "valid") \
+            if all(os.path.exists(os.path.join(d, "valid", "_annotations.coco.json")) for d in dirs) \
+            else ([], None)
+    else:
+        va_records = []
     real_records = list(tr_records) + list(va_records or [])
     if val_records is None:
         val_records = build_real_val_records(cfg.data_dir)
     if not val_records:
         val_records = real_records[:40]
-    print(f"[data] real records for scene mix={len(real_records)} | val={len(val_records)}")
+    print(f"[data] real records for scene mix={len(real_records)} | val={len(val_records)}", flush=True)
+    if len(dirs) > 1:
+        print(f"[data] merged {len(dirs)} dataset folders")
 
     grid = cfg.img_size // 14
     ds = DetectorSynthDataset(
@@ -224,7 +244,7 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
         decoder_dim=cfg.decoder_dim, decoder_mid_dim=cfg.decoder_mid_dim,
         decoder_dropout=cfg.decoder_dropout, use_mid_feats=cfg.use_mid_feats,
     ).to(device)
-    print(f"[model] trainable={count_trainable(model):,} (mode={cfg.finetune_mode})")
+    print(f"[model] trainable={count_trainable(model):,} (mode={cfg.finetune_mode})", flush=True)
 
     lr_bb = cfg.lr_backbone if cfg.finetune_mode == "partial" else (
         cfg.lr_lora if cfg.finetune_mode == "lora" else None)
@@ -234,10 +254,16 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
     scheduler = LambdaLR(optimizer, lr_lambda=lambda s: warmup_cosine_factor(s, warmup_steps, total_steps))
     scaler = None
     if device.type == "cuda":
+        # AMP works on ROCm through the same cuda API, but some builds fail
+        # to construct the scaler — fall back to fp32 training instead of dying
         try:
-            scaler = torch.amp.GradScaler("cuda")
-        except (AttributeError, TypeError):
-            scaler = torch.cuda.amp.GradScaler()
+            try:
+                scaler = torch.amp.GradScaler("cuda")
+            except (AttributeError, TypeError):
+                scaler = torch.cuda.amp.GradScaler()
+        except Exception as e:
+            print(f"[amp] GradScaler unavailable ({e}) -> fp32 training")
+            scaler = None
 
     best = {"f1": -1.0, "epoch": -1, "state": None}
     bad = 0
@@ -250,15 +276,17 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
         def tqdm(x, **k):
             return x
 
-    print(f"[train] steps/epoch={len(dl)} epochs={cfg.epochs}")
+    print(f"[train] steps/epoch={len(dl)} epochs={cfg.epochs}", flush=True)
     t_train0 = time.time()
     for epoch in range(1, cfg.epochs + 1):
+        epoch_start = time.time()
         model.train()
         tot = 0.0
         seen = 0
-        pbar = tqdm(dl, desc=f"{epoch:03d}/{cfg.epochs}", unit="batch",
-                    bar_format="{l_bar}{bar:20}{r_bar}", leave=False,
-                    dynamic_ncols=True)
+        pbar = tqdm(dl, desc=f"{epoch}/{cfg.epochs}", unit="batch",
+                    bar_format="{l_bar}{bar:24}{r_bar}", leave=False,
+                    dynamic_ncols=True, mininterval=1.0,
+                    disable=None, file=sys.stderr)
         for batch in pbar:
             px = batch["image"].to(device, non_blocking=True)
             tgt = batch["target"].to(device, non_blocking=True)
@@ -283,7 +311,7 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
             scheduler.step()
             tot += loss.item() * px.size(0)
             seen += px.size(0)
-            if hasattr(pbar, "set_postfix"):
+            if not getattr(pbar, "disable", False):
                 pbar.set_postfix(loss=f"{loss.item():.3f}",
                                  ce=f"{parts['ce']:.3f}", dice=f"{parts['dice']:.3f}")
         tr_loss = tot / max(seen, 1)
@@ -294,7 +322,7 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
         history["val_prec"].append(metrics["precision"])
         history["val_rec"].append(metrics["recall"])
         improved = metrics["f1"] > best["f1"] + 1e-4
-        star = "  *best*" if improved else ""
+        star = " *best*" if improved else ""
         if improved:
             best.update(f1=metrics["f1"], epoch=epoch,
                         state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
@@ -310,15 +338,17 @@ def run_training(cfg: DetectorConfig, val_records: Optional[List[dict]] = None) 
             }, ckpt_path)
         else:
             bad += 1
-        elapsed = time.time() - t_train0
-        eta = elapsed / epoch * (cfg.epochs - epoch) if epoch < cfg.epochs else 0.0
-        print(f"[epoch {epoch:03d}/{cfg.epochs}] loss={tr_loss:.4f} "
-              f"(ce={parts['ce']:.3f} dice={parts['dice']:.3f}) "
-              f"val: P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
+        epoch_time = time.time() - epoch_start
+        elapsed_total = time.time() - t_train0
+        avg_epoch_time = elapsed_total / epoch
+        eta = avg_epoch_time * (cfg.epochs - epoch)
+        epoch_str = f"{epoch_time:.1f}s" if epoch_time < 60 else format_time(epoch_time)
+        print(f"Epoch {epoch}/{cfg.epochs} {'━' * 40} {epoch_str} | "
+              f"loss={tr_loss:.4f} P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
               f"F1={metrics['f1']:.3f} IoU={metrics['mean_iou']:.3f} "
-              f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m{star}", flush=True)
+              f"ETA={format_time(eta)}{star}", flush=True)
         if bad >= cfg.patience:
-            print(f"[early stop] patience {cfg.patience}")
+            print(f"[early stop] patience {cfg.patience}", flush=True)
             break
 
     # final save if never improved (keep last state so export always possible)
