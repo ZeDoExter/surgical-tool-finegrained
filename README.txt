@@ -2,7 +2,7 @@ pi/ — final Pi package (pkg6 + YOLO nomix)
 =========================================
 YOLO detect ทุกคลาส; 7 ตัวนี้ป้าย YOLO = final ไม่ส่ง ViT:
 Cotton_Piler / Root_Tip_Pick / Dental_Mirror / Triple_Syringe /
-Scapel_Handle / Root_Tip_Elevator_LR / Cartridge_Syringe
+Scalpel_Handle / Root_Tip_Elevator_LR / Cartridge_Syringe
 (YOLO_FINAL_CLASSES ใน app_dinoyolo.py) คลาสที่เหลือวิ่ง cascade/ViT เดิม
 
 ไฟล์:
