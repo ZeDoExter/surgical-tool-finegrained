@@ -26,7 +26,7 @@ from yolo_detector_ncnn import YoloDetectorNCNN as YoloDetectorONNX
 from dino_classifier_onnx import DinoClassifierONNX
 
 API_KEY = "e5bdb16ce0552c091383244b3c814ffe51bd15fa73e0bc6f4dc7b09afe00a6a67d2bcc02d3ec3accceec4357b05d275a4cc5e98667b47cae0c154fc55c864f13"
-APP_VERSION = "2026-09-07-v9pkg6"   # bump on every deploy; shown at boot and at
+APP_VERSION = "2026-09-07-v9pkg7"   # bump on every deploy; shown at boot and at
                                 # / so a field report can always name its build
 CLASSIFY_REFRESH_SEC = 5.0
 DETECT_DIR = "onnx_export"
@@ -67,7 +67,7 @@ VIT_ONLY_CLASSES = {           # same-shape/silhouette pairs the ViT must
 # flow through the normal cascade/ViT pipeline below.
 YOLO_FINAL_CLASSES = {
     "Cotton_Piler", "Root_Tip_Pick", "Dental_Mirror", "Triple_Syringe",
-    "Scapel_Handle", "Root_Tip_Elevator_LR", "Cartridge_Syringe",
+    "Scalpel_Handle", "Root_Tip_Elevator_LR", "Cartridge_Syringe",
 }
 YOLO_FINAL_MIN_SCORE = 0.50  # unknown-reject: below this the track stays "..."
 
@@ -108,7 +108,7 @@ CLASS_COLORS_BGR = [
     (90, 90, 90),       # Root_Tip_Elevator_LR     dark gray
     (40, 20, 130),      # Root_Tip_Elevator_Straight maroon
     (30, 110, 110),     # Root_Tip_Pick             olive
-    (60, 140, 0),       # Scapel_Handle             dark green
+    (60, 140, 0),       # Scalpel_Handle            dark green
     (180, 30, 110),     # Suture_Scissors           dark violet
     (130, 90, 70),      # Triple_Syringe            dark slate
 ]
