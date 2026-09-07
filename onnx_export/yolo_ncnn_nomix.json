@@ -1,0 +1,48 @@
+{
+  "classes": [
+    "Artery_Forceps",
+    "Cartridge_Syringe",
+    "Cotton_Piler",
+    "Dental_Mirror",
+    "Mandibular_Universal_Forceps_23",
+    "Maxillary_Universal_Forceps_150",
+    "Needle_Holder",
+    "Root_Elevators",
+    "Root_Tip_Elevator_LR",
+    "Root_Tip_Elevator_Straight",
+    "Root_Tip_Pick",
+    "Scapel_Handle",
+    "Suture_Scissors",
+    "Triple_Syringe"
+  ],
+  "img_size": 512,
+  "conf_threshold": 0.25,
+  "nms_iou": 0.45,
+  "calibration_ratio": null,
+  "model_dir": "yolo26n_v10_nomix_512",
+  "v9_to_ours": {
+    "0": 0,
+    "2": 1,
+    "3": 2,
+    "4": 3,
+    "5": 4,
+    "7": 5,
+    "9": 6,
+    "11": 7,
+    "13": 8,
+    "14": 9,
+    "16": 10,
+    "17": 11,
+    "18": 12,
+    "19": 13
+  },
+  "head_to_main": {
+    "1": "Artery_Forceps",
+    "6": "Mandibular_Universal_Forceps_23",
+    "8": "Maxillary_Universal_Forceps_150",
+    "10": "Needle_Holder",
+    "12": "Root_Elevators",
+    "15": "Root_Tip_Elevator_Straight"
+  },
+  "use_head_override": false
+}
