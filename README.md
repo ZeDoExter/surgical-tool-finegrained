@@ -103,33 +103,32 @@ dropped classifier accuracy (R3 0.9319 on mix data vs R4 0.9595 without).
 Neighbor-erased crops did not help. See `TUNING_EXPLANATION_TH.md`
 (classifier tuning story, Thai) and `ALGORITHM.md` (full algorithm).
 
-## Pi deployment (`pi_final_v7/`)
+## Pi deployment (`pi/`)
 
-Raspberry Pi 5, ONNX Runtime CPU only:
+Raspberry Pi 5 final package (YOLO nomix + DINOv2 labels, pkg6):
 
 ```
-pi_final_v7/
-  app.py              # DINO detector + classifier (recommended main path)
-  app_student.py      # distilled student detector (fastest, masks kept)
-  app_dinoyolo.py     # YOLO26n boxes + DINOv2 labels
-  app_yolo.py         # YOLO boxes only
-  detector_onnx.py / dino_classifier_onnx.py / yolo_detector_onnx.py
-  det_postprocess.py  # numpy/cv2 connected-components + NMS (shared)
-  onnx_export/        # models + *_meta.json (models are git-ignored;
-                      # copy from a training machine)
+pi/
+  app_dinoyolo.py         # main app: YOLO all 14 classes; 7 YOLO-final
+                          # (Cotton_Piler / Root_Tip_Pick / Dental_Mirror /
+                          #  Triple_Syringe / Scapel_Handle /
+                          #  Root_Tip_Elevator_LR / Cartridge_Syringe),
+                          # rest via cascade/ViT
+  yolo_detector_ncnn.py   # YOLO26n NCNN wrapper (no ultralytics on Pi)
+  dino_classifier_onnx.py # DINOv2 + ArcFace classifier w/ tip TTA
+  onnx_export/            # weights (git-ignored, copy from training machine):
+                          # yolo26n_v10_nomix_512/ + surgical_dino_fusion.onnx[.data]
 ```
 
 ```bash
-pip install flask flask-cors gunicorn opencv-python-headless numpy onnxruntime
-gunicorn --workers 1 --threads 8 --worker-class gthread --timeout 0 \
-    --bind 0.0.0.0:8000 app:app
+pip install flask flask-cors gunicorn opencv-python-headless numpy onnxruntime ncnn
+YOLO_MODEL=nomix OMP_NUM_THREADS=4 gunicorn --workers 1 --threads 8 \
+  --worker-class gthread --timeout 0 --bind 0.0.0.0:8000 app_dinoyolo:app
 # http://<pi-ip>:8000/video_feed?token=<API_KEY>
 ```
 
-`--workers 1` always (one camera). See `pi_final_v7/README.txt`.
-
-Notebooks (`DentalInstrument_*.ipynb`, git-ignored, regenerate with
-`python tools/make_notebook.py`) reproduce the Colab flow.
+`--workers 1` always (one camera). Boot log must show
+`version=2026-09-07-v9pkg6 model=nomix`. See `pi/README.txt`.
 
 ## License
 
