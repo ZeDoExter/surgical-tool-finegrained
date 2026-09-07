@@ -58,7 +58,7 @@ VIT_ONLY_CLASSES = {           # same-shape/silhouette pairs the ViT must
     "Mandibular_Universal_Forceps_23", "Maxillary_Universal_Forceps_150",
     "Root_Elevators", "Root_Tip_Elevator_Straight",
     # NOTE: Cotton_Piler / Root_Tip_Pick / Dental_Mirror / Triple_Syringe /
-    # Scapel_Handle / Root_Tip_Elevator_LR / Cartridge_Syringe would qualify,
+    # Scalpel_Handle / Root_Tip_Elevator_LR / Cartridge_Syringe would qualify,
     # but field 2026-09-07 showed YOLO beats ViT on those 7 Pi-side — they
     # bypass ViT via YOLO_FINAL_CLASSES below instead.
 }
